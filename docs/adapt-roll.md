@@ -259,32 +259,78 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 ## 4、开发计划
 
-### Phase 0：协议与基线
+本章是交给后续开发 Agent 的执行顺序。每个 Phase 都遵循同一纪律：**先实验/阅读，再做最小代码改动，再运行该 Phase 的测试，达到验收点后只提交一个语义单一的 commit 并推送。** 验收失败时先修复或在 commit 说明中记录阻塞原因；不得跳过失败测试进入下一 Phase，也不得提前实现 DP>1、shuffle、动态 batching 或其他非 MVP 能力。
 
-- [ ] 固定 ROLL 与 PrefixGrouper 版本；
-- [ ] 选定一个文本 GRPO 示例和固定 rollout fixture；
-- [ ] 记录 baseline logits/loss/gradient/perf；
-- [ ] 定义 ROLL group metadata 和 eligibility 规则。
+`dependency/ROLL` 是固定在 `78c8c7d` 的参考快照；每次开发前先确认它没有被无意改动。若某个 MVP hook 必须改 ROLL 源码，应只修改计划列出的文件，并在同一 commit 中记录为将来向 ROLL 提交的最小 patch。
 
-### Phase 1：数据适配与测试
+### Phase 0：环境确认与可复现基线（不接入 ROLL）
 
-- [ ] 实现 group map 与完整 batch transform/restore；
-- [ ] 添加 CPU 单测和不变量检查；
-- [ ] 保留 `prefix_group_id`，并实现 DP=1 / no-shuffle guard；
-- [ ] 完成 ROLL 最小 hook PR。
+**目标：** 证明目标 Transformers 模型、当前 PrefixGrouper 和 GPU 环境可以完成最基本的 shared-prefix forward；此阶段不改 ROLL 训练路径。
 
-### Phase 2：FSDP2 PoC
+1. **检查。** 记录 PrefixGrouper、ROLL snapshot、PyTorch、Transformers、FlashAttention、CUDA 和 GPU 型号/显存；选择一个纯文本 causal LM、`flash_attention_2`、BF16、`G=2` 作为唯一首发组合。
+2. **实验 A：baseline attention。** 用固定随机种子、两组 prompt/response token 构造普通 `[P][R]` batch，保存 baseline response logprob、loss、参数梯度和 peak memory。
+3. **实验 B：attention monkey-patch。** 加载相同模型，安装“无 `prefix_grouper` 时直接调用原 attention”的 patch；再次运行实验 A，确认 logits/loss/梯度与 baseline 在允许精度内相同。
+4. **实验 C：PrefixGrouper core。** 不引入 DataProto/Ray/FSDP2，直接执行 `PrefixGrouper.from_ungrouped_masks → concat_input → model(..., prefix_grouper=...) → split_output`；验证 response logprob、loss、梯度与普通 batch 对齐。
+5. **写入记录。** 在本文件或独立结果文档写清模型版本、命令、fixture 形状、容差和三项实验结果。
 
-- [ ] 增加 Transformers attention registration/透传；
-- [ ] 打通单卡文本 GRPO actor forward/backward；
-- [ ] 完成 on/off 数值等价和显存/吞吐测量；
-- [ ] 加入兼容性 gate 与 baseline fallback。
+**验收点：** A/B/C 均通过；尤其 B 证明 monkey-patch 不破坏 baseline，C 证明 position IDs 和 prefix-last 边界正确。任何模型 kwargs 无法传到每层 attention 的情况在此停止，换模型或修 patch，不进入 Phase 1。
 
-### Phase 3：上游化
+**提交：** 仅提交测试 fixture、独立 PrefixGrouper adapter/patch 原型和实验记录。提交信息建议：`test: establish ROLL PrefixGrouper baseline`。
 
-- [ ] ROLL 可选集成 PR；
-- [ ] 补齐 FSDP2 的安装、配置与回退说明；
-- [ ] 固化兼容性矩阵和复现实验脚本。
+### Phase 1：实现单文件 ROLL adapter 与单元测试
+
+**目标：** 在 `roll/utils/prefix_grouper.py`（新增）集中完成 MVP 的全部数据转换；不改 pipeline，不启动完整训练。
+
+1. **先写失败测试。** 针对连续的 `prefix_group_id` runs 写 CPU 单测：正常 `G=2/4`、变长 response、prompt 不一致、run 长度不等于 G、空 response、非 G 整除 micro-batch。
+2. **实现 attention patch。** 提供幂等的 `install_prefix_grouper_attention_patch()`：保存原 attention function；从 kwargs pop `prefix_grouper`；为 `None` 时完全透传回原函数；否则调用 PrefixGrouper attention。不得修改全局模型 config。
+3. **实现 batch helper。** 实现 `build_pg_from_micro_batch(data, group_size, pad_id)`，返回 `PrefixGrouper`、grouped input IDs、padding mask、重置后的 2D position IDs、连续 run 映射。它只接受 ROLL 已有的 `input_ids/prompt_mask/response_mask/prefix_group_id`。
+4. **实现 restore。** 实现 `forward_with_prefix_grouper()`：调用模型、`split_output(include_prefix_last=1)`，将有效 response prediction logits 可微 scatter 回普通 `[N,S,V]` layout。不得改 `ActorWorker.loss_func()`。
+5. **运行单测。** 所有 Phase 1 测试须在 CPU 通过；有 GPU 时补充小模型的 forward/gradient 对齐测试。
+
+**验收点：** adapter 可被独立 import；无 prefix 参数时 attention patch 数值等价；有效 group 返回与 baseline 对齐的 restored logits；非法输入报可读错误，不静默重排或拆组。
+
+**提交：** 只提交 adapter 与其单测，不接触 FSDP2/pipeline。提交信息建议：`feat: add ROLL PrefixGrouper MVP adapter`。
+
+### Phase 2：接入 ROLL 的 DP=1 数据顺序与 FSDP2 前向
+
+**目标：** 让真实 ROLL actor 的 `compute_log_probs` 和 `train_step` 都经过 Phase 1 adapter，同时保持原 actor loss 不变。
+
+1. **保留 group ID。** 在 `postprocess_generate()` 将复制后的 prompt 标识写为 `prefix_group_id`；确认 RLVR pipeline 重设/删除 `prompt_id` 时不会删除它。
+2. **加 MVP fail-fast guards。** 启用时要求 `dp_size=1`、`cp_size=1`、无 dynamic batching/packing、无 LoRA/多模态；`infer_batch_size`、`per_device_train_batch_size` 和外层 backward batch size 都必须能被 G 整除。
+3. **保持连续顺序。** 在 actor train 路径跳过 `batch_balance()`；在 `ActorWorker.train_step()` 对 PrefixGrouper 启用时使用 `shuffle=False`。不要实现 group-aware sampler。
+4. **接入两个 FSDP2 路径。** 在 `FSDP2InferStrategy.forward_step()` 与 `FSDP2TrainStrategy.train_step()` 的现有 autocast/no-sync 范围内调用同一个 adapter。`forward_step` 的 `micro_batch_size` 与训练内层 `per_device_train_batch_size` 都要先做 `% G == 0` 校验。
+5. **最小烟雾测试。** 用固定 rollout fixture 跑一次 `compute_log_probs`，再跑一次 actor `train_step`；确认返回 tensor shape、metrics key、optimizer step 和梯度均正常。
+
+**验收点：** 关闭开关时执行完全原路径；开启开关时 actor loss 不修改、response logprob 对齐、单步反向和 optimizer step 成功。任何 DP>1/shuffle/dynamic 配置必须在启动前得到明确错误。
+
+**提交：** 只提交必要 ROLL hook、DP=1 guards 和集成 smoke test。提交信息建议：`feat: wire PrefixGrouper into ROLL FSDP2`。
+
+### Phase 3：数值验收、性能评估与交付整理
+
+**目标：** 把“能跑”提升为“可验证、可复现、可交接”，不增加功能范围。
+
+1. **数值验收。** 对同一固定 rollout 分别运行开关 off/on，比对 response logprob、entropy、KL、actor loss、grad norm、首个 optimizer step 后参数；记录 BF16 与 FP32 容差。
+2. **训练验收。** 以小模型执行至少两个 PPO epoch/多个 train step，确认旧 logprob cache、metrics 聚合和 checkpoint 不出现 shape/顺序问题。
+3. **性能评估。** 在固定 GPU、模型、prompt 长度、response 长度、G 下测 actor forward/backward、end-to-end step、peak memory、adapter transform/restore 时间；报告 baseline 与 MVP 的比值，并说明恢复完整 logits 的额外开销。
+4. **负向验收。** 覆盖功能关闭、`dp_size>1`、shuffle、动态 batching、非 G 整除、破损 group ID；每一种均应按设计走原路径或 fail-fast。
+5. **文档与复现。** 更新本设计的“当前结论”、兼容矩阵、启动命令和已知限制；把测试命令写成可复制执行的形式。
+
+**验收点：** 数值与梯度在容差内对齐；小训练稳定完成；性能报告可复现；所有限制均被明确验证。不得因为性能未提升而私自改为 direct-logprob 或扩展 DP>1，应先提交测量结果并单独决策。
+
+**提交：** 仅提交测试、结果文档、示例配置和必要修复。提交信息建议：`test: validate ROLL PrefixGrouper DP1 MVP`。
+
+### Phase 4：最终复查与停止条件
+
+**目标：** 形成一个可 review 的 MVP 分支，而不是继续扩大功能。
+
+1. 检查每个 Phase 均有独立 commit、测试记录和对应结果；工作区干净。
+2. 对比 `use_prefix_grouper=false` 的原行为，确认默认配置零回归。
+3. 整理后续版本的候选项：DP>1 group-aware balance、group-aware shuffle/dynamic batching、direct logprob restore、LoRA/多模态；只记录为 issue/后续计划，不在本分支实施。
+4. 推送最终分支，准备两个独立 review：PrefixGrouper adapter review 与 ROLL hook review。
+
+**验收点：** 所有 Phase 0–3 的验收项已满足，且未引入任何非 MVP 代码。达到此点即停止开发；未来通用版本从新的分支/PR 开始。
+
+**提交：** 如只含文档/结果，可提交 `docs: finalize ROLL PrefixGrouper DP1 MVP`；若无新增内容则不制造空提交。
 
 ## 5、当前结论
 
