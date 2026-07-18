@@ -103,6 +103,8 @@ actor worker `initialize()` 必须在模型构造前按此顺序执行：
 
 首个实现必须固定一个纯文本 HF 模型族和 Transformers 版本，并记录在兼容矩阵中；不可宣称所有 `AutoModelForCausalLM` 自动支持。
 
+**必须先补齐 attention fallback。** 现有 `src/prefix_grouper/utils/register_transformers.py` 的 `_prefix_grouper_attention_forward()` 将 `prefix_grouper` 声明为必填参数。因此一旦把模型的 `_attn_implementation` 设为 `prefix_grouper_attention`，普通 baseline forward 会因缺参失败。实现时必须将其改为 `Optional[PrefixGrouper] = None`：为 `None` 时原样调用 `ALL_ATTENTION_FUNCTIONS[prefix_grouper_attn_func]`，并保留原 `attention_mask`；非 `None` 时才走 `AttentionForward`。这是“功能关闭/mini-batch fallback 仍等价 baseline”的必要条件，不能留给 capability probe 兜底。
+
 ### 2.3 数据契约：`PrefixGroupLayout`
 
 `postprocess_generate()` 仍生产原始 ROLL batch，但新增以下只描述关联、不改张量数值的字段：
@@ -180,6 +182,86 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 2. **PrefixGrouper：ROLL adapter 库。** 新增 `integrations/roll/{capability.py,layout.py,transform.py,positions.py,restore.py}` 及单测；只依赖稳定 ROLL batch 字段，不 fork ROLL 源码。
 3. **ROLL：可选 FSDP2 hook。** 加 config、模型加载时 attention registration/选择、`fsdp2_strategy.py` 的唯一 grouped-forward helper；adapter 为可选依赖，默认严格 baseline。
 4. **集成验收。** 固定版本、固定模型和 rollout fixture 下通过 on/off 等价、FSDP2 backward、DP=2 group-preserving 和性能报告，再公开示例。
+
+### 2.8 文件级实施蓝图
+
+下表是 MVP 的**最小修改清单**。文件名以 `dependency/ROLL` 快照为准；实际向 ROLL 提交时在对应源文件作相同修改。除表中明确列出的文件外，future Agent 不应改动 actor loss、GRPO advantage 或 optimizer。
+
+| 仓库 / 文件 | 新增或修改的符号 | 实现要求 |
+| --- | --- | --- |
+| PrefixGrouper `src/prefix_grouper/utils/register_transformers.py` | `_prefix_grouper_attention_forward` | `prefix_grouper: Optional[...] = None`；`None` 时无条件走原 backend 并使用原 mask，非 `None` 时走现有 `AttentionForward`。返回值始终保持 Transformers attention interface 的 `(attn_output, attn_weights)` 结构。 |
+| PrefixGrouper `integrations/roll/layout.py` | `PrefixGroupLayout`、`build_layout(data, group_size)` | 只读取 ROLL 标准 batch 字段和新增 group metadata；返回 group-to-row 映射、prefix/response 长度、`PrefixGrouper` 实例和不合格原因。不得修改 `data`。 |
+| PrefixGrouper `integrations/roll/transform.py` | `make_grouped_inputs(layout, data)` | 调 `concat_input()`，返回 grouped `input_ids`、`attention_mask=padding_mask`、2D position IDs；检查 grouped 总长度。 |
+| PrefixGrouper `integrations/roll/restore.py` | `restore_logits(layout, grouped_logits, original_input_ids)` | 调 `split_output(include_prefix_last=1)`，按第 2.5 节位置 scatter 到新建的 `[N,S,V]` tensor；函数须完全可微。 |
+| PrefixGrouper `integrations/roll/sampler.py` | `iter_group_minibatches`、`group_balance` | group-level shuffle、DP 分箱和固定 `M/G` groups 的 mini-batch 切分；输入/输出都是原 ROLL row indices 或 `DataProto`，不产生 grouped model inputs。 |
+| ROLL `roll/configs/worker_config.py` | `PrefixGrouperConfig` 和 `WorkerConfig.prefix_grouper` | 默认 `enabled=False`；在 dataclass/序列化中可被 YAML 正确加载。 |
+| ROLL `roll/configs/model_args.py` | `attn_implementation` 类型 | 加入 `prefix_grouper_attention` 合法值，不改变现有 `fa2 -> flash_attention_2` 映射。 |
+| ROLL `roll/models/model_providers.py` | PrefixGrouper 初始化分支 | 在 `AutoConfig`/`from_pretrained` 之前注册 attention；仅 actor FSDP2 配置启用时设置 custom implementation。把 fallback backend 放入 model 可透传的配置/kwargs，避免全局可变状态。 |
+| ROLL `roll/utils/functionals.py` | `postprocess_generate`、`group_balance` | 生成 group metadata；新增 group-aware 平衡函数，旧 `batch_balance` 不改语义。 |
+| ROLL `roll/pipeline/rlvr/rlvr_pipeline.py` | actor train 前的平衡调用 | 仅在 PrefixGrouper 启用时调用 `group_balance`，否则仍调用 `batch_balance`。 |
+| ROLL `roll/pipeline/base_worker.py` | actor `train_step` 的 iterator | 外层 PPO iterator 的 shuffle 单位从 row 改为 group，仍产出大小为 `M * gradient_accumulation_steps` 的普通 `DataProto`。 |
+| ROLL `roll/distributed/strategy/fsdp2_strategy.py` | group-aware chunk/iterator、`_prefix_grouper_forward` | `forward_step` 用 group-aware chunk 代替 `batch.chunk`；`train_step` 内层用 group-aware iterator 代替 `batch.make_iterator(M)`；两处统一调用 helper。 |
+
+建议先在 PrefixGrouper 新增 adapter 文件及其单测，再改 ROLL hook。这样 transform/restore 的大部分逻辑能在 CPU 上用合成 `DataProto` 验证，不需要一开始启动 Ray/FSDP2。
+
+### 2.9 调用链伪代码与不可变接口
+
+以下伪代码规定实际调用顺序；名称可以小幅调整，但数据流和回退位置不能改变：
+
+```python
+# ROLL: rollout 后，仍是普通 [N, S] rows
+batch = postprocess_generate(...)
+batch = attach_prefix_group_metadata(batch, rollout_request_ids, G)
+
+# ROLL controller: 仅 actor train 路径；reorder 的仍是普通 rows
+if cfg.prefix_grouper.enabled:
+    group_balance(batch, dp_size, rows_per_rank, group_key="prefix_group_id")
+else:
+    batch_balance(batch, dp_size, minibatch_size)
+
+# ActorWorker: 先 group shuffle，再以 outer_size=M*grad_accum 产出普通 DataProto
+for backward_batch in iter_group_minibatches(batch, outer_size):
+    strategy.train_step(backward_batch, loss_func)  # FSDP2 内再切成 M 行/步
+
+# FSDP2: forward_step 与 train_step 均在各自已建立的 autocast/no_sync 中调用
+def _prefix_grouper_forward(data):
+    layout = build_layout(data, G)
+    if not layout.eligible:
+        return _fsdp2_forward(original_inputs)  # 原参数、原 mask、原 position ids
+    grouped = make_grouped_inputs(layout, data)
+    grouped_logits = model(**grouped, prefix_grouper=layout.grouper,
+                           prefix_grouper_attn_func=cfg.attention_backend).logits
+    return restore_logits(layout, grouped_logits, data.batch["input_ids"])
+
+# 这里的 logits 已回到 [N,S,V]；现有代码不变
+loss, metrics = ActorWorker.loss_func(data, restored_logits)
+loss.backward()
+```
+
+`PrefixGroupLayout` 的建议 dataclass 字段如下，避免未来实现用隐式位置或 strategy 临时状态：
+
+```python
+@dataclass(frozen=True)
+class PrefixGroupLayout:
+    row_indices: list[list[int]]       # grouped row -> 原 mini-batch row，组内按 completion index
+    prompt_lens: Tensor                # [num_groups]
+    response_lens: Tensor              # [num_rows]，与 flatten(row_indices) 同序
+    group_size: int
+    original_shape: tuple[int, int]    # (N, S)
+    grouper: PrefixGrouper
+```
+
+实现 `build_layout()` 时应返回 `LayoutBuildResult(layout: Optional[PrefixGroupLayout], reason: Optional[str])`，而不是用异常表示普通数据不合格；只有配置错误和程序不变量破坏才抛异常。这样 fallback 指标可以按原因聚合，例如 `missing_group_id`、`group_size_mismatch`、`prompt_mismatch`、`response_empty`、`max_position_exceeded`。
+
+### 2.10 开发前必须先完成的三个小实验
+
+在开始 ROLL 的大范围改动前，先完成并记录以下实验；任一失败都应先修模型 adapter，而不是继续调度开发：
+
+1. **attention fallback：** custom attention implementation 下，`prefix_grouper=None` 的 logits 与原 `flash_attention_2` logits 对齐。
+2. **参数透传：** selected HF text model 的 `model(..., prefix_grouper=grouper)` 确实让每层 self-attention 收到同一对象；以计数 hook 证明，不能只看无异常。
+3. **单 batch 等价：** 不接 ROLL，直接用两组 `[P][R]` 合成 token batch，比对 baseline 与 transform → model → restore 的 response logprob、loss 和 parameter gradient。
+
+三个实验通过后，才将 adapter 接进 ROLL 的 metadata、group-aware 调度和 FSDP2 hook。这样能把“模型 attention 不兼容”和“ROLL 数据/调度错误”分离，显著降低排障成本。
 
 ## 3、测试验证
 
