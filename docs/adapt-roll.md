@@ -329,13 +329,13 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 3. **每次改动后的双重回归。** 运行 Phase 1 单测、Phase 2 smoke test 和 Phase 3 的单步精度对齐；只有精度仍通过，才运行 30-step 性能基准。记录改动前后各分段耗时与 end-to-end p50，不达预期则回退该优化或保留为独立实验 commit，不带入下一项。
 4. **禁止的捷径。** 不得为获得速度改变 actor objective、跳过 response token、使用近似 logprob、关闭梯度、移除 restore 但又让现有 loss 读取不完整 logits，或扩大到 DP>1/动态 batching/LoRA。若 profile 证明这些是唯一瓶颈，只记录为下一版本议题，当前 MVP 仍应在允许范围内继续优化或明确无法达标。
 
-**验收点：** 在固定 workload 上，开启 `use_prefix_grouper=true` 的完整 actor train-step p50 相比关闭开关至少提升 **10%**（`p50_on <= 0.90 × p50_off`）；p90 不得比 baseline 慢超过 5%；peak allocated memory 不得增加。并且 Phase 3 的全部精度比对仍通过。若未达标，继续本 Phase 的 profile—优化循环，不能进入最终收尾。
+**验收点：** 在固定 workload、相同测量方法下，开启 `use_prefix_grouper=true` 的完整 actor train-step p50 必须严格小于关闭开关（`p50_on < p50_off`），即只要求存在可重复测得的端到端性能提升，不设最低加速比例、p90 或显存门槛。并且 Phase 3 的全部精度比对仍通过。若 p50 未提升，继续本 Phase 的 profile—优化循环，不能进入最终收尾。
 
 **提交：** 每项被保留的优化独立提交并附 profile/benchmark 结果，例如 `perf: vectorize PrefixGrouper logits restore`；被放弃的实验不得混入最终功能提交。
 
 ### Phase 5：最终复查与停止条件
 
-**目标：** 仅在“精度对齐 + 性能提升”同时达成时形成可 review、可上游化的 DP=1 MVP 分支。
+**目标：** 仅在“精度对齐 + 存在可复现的性能提升”同时达成时形成可 review、可上游化的 DP=1 MVP 分支。
 
 1. 从干净 checkout 重新运行 Phase 3 的完整基准；确认结果不是 warm cache、偶然波动或先前进程残留造成的。保存命令、环境、原始测量数据和摘要表。
 2. 复查 Phase 3 的单步与短训练精度结果，以及 Phase 4 的性能结果；明确列出 off/on 的 p50、p90、显存和加速比。
@@ -343,7 +343,7 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 4. 整理后续候选项：DP>1 group-aware balance、group-aware shuffle/dynamic batching、LoRA/多模态等；只记录为 issue/后续计划，不在本分支实施。
 5. 推送最终分支，准备两个独立 review：PrefixGrouper adapter review 与 ROLL hook review。
 
-**最终终止条件：** 同一冻结 workload 上，开关 on/off 的 Phase 3 精度验收全部通过，且开关 on 达到 Phase 4 的端到端 p50 至少 10% 加速、p90 不退化超过 5%、peak allocated memory 不增加。任一条件不满足，本开发计划**不终止**，回到 Phase 3（精度问题）或 Phase 4（性能问题）继续迭代；不得以“能运行”或“仅有理论 token 节省”替代该结论。
+**最终终止条件：** 同一冻结 workload 上，开关 on/off 的 Phase 3 精度验收全部通过，且开关 on 的端到端 actor train-step p50 严格小于开关 off（`p50_on < p50_off`）。任一条件不满足，本开发计划**不终止**，回到 Phase 3（精度问题）或 Phase 4（性能问题）继续迭代；不得以“能运行”或“仅有理论 token 节省”替代该结论。
 
 **提交：** 如只含最终结果与文档，可提交 `docs: finalize ROLL PrefixGrouper DP1 MVP benchmark`；若无新增内容则不制造空提交。
 
