@@ -305,32 +305,47 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **提交：** 只提交必要 ROLL hook、DP=1 guards 和集成 smoke test。提交信息建议：`feat: wire PrefixGrouper into ROLL FSDP2`。
 
-### Phase 3：数值验收、性能评估与交付整理
+### Phase 3：建立精度与性能的最终验收基准
 
-**目标：** 把“能跑”提升为“可验证、可复现、可交接”，不增加功能范围。
+**目标：** 固定一套不会被“挑选简单样本”影响的 off/on 对比基准，并先证明精度对齐。这套基准是后续优化与最终停止的唯一裁判；在它通过前，不得宣称特性完成。
 
-1. **数值验收。** 对同一固定 rollout 分别运行开关 off/on，比对 response logprob、entropy、KL、actor loss、grad norm、首个 optimizer step 后参数；记录 BF16 与 FP32 容差。
-2. **训练验收。** 以小模型执行至少两个 PPO epoch/多个 train step，确认旧 logprob cache、metrics 聚合和 checkpoint 不出现 shape/顺序问题。
-3. **性能评估。** 在固定 GPU、模型、prompt 长度、response 长度、G 下测 actor forward/backward、end-to-end step、peak memory、adapter transform/restore 时间；报告 baseline 与 MVP 的比值，并说明恢复完整 logits 的额外开销。
-4. **负向验收。** 覆盖功能关闭、`dp_size>1`、shuffle、动态 batching、非 G 整除、破损 group ID；每一种均应按设计走原路径或 fail-fast。
-5. **文档与复现。** 更新本设计的“当前结论”、兼容矩阵、启动命令和已知限制；把测试命令写成可复制执行的形式。
+1. **冻结代表性 workload。** 使用与真实 GRPO rollout 相同的 tokenizer、模型、BF16、FSDP2 配置和 `DP=1`，固定随机种子。至少包含 `G=4`，并选择共享 prompt token 占该 group 原始 token 总量不少于 50% 的 fixture；记录 prompt/response 长度分布、有效 token 数和 group 数。该 workload 只用于验收，不能在优化期间更换。
+2. **定义测量方法。** 先 warm-up 10 step，再各测 off/on 30 个完整 actor train step；每次都同步 CUDA 后计时，报告 p50、p90、均值、peak allocated memory。计时覆盖 ROLL actor 取 batch、PrefixGrouper transform/restore、forward、backward、optimizer step，但不包含 rollout 推理与网络 I/O。关闭时必须使用完全原始 ROLL 路径。
+3. **精度对齐：单步。** 对相同固定 rollout 比对 response token 的 logprob、entropy、KL、actor loss、grad norm、每个 parameter gradient，以及第一个 optimizer step 后的参数。FP32 reference 使用 `rtol=1e-4, atol=1e-5`；BF16 使用 `rtol=2e-2, atol=2e-2`。若某指标不适合逐元素比对，记录最大绝对/相对误差与原因，不能只报告均值。
+4. **精度对齐：短训练。** 从同一 checkpoint、同一 rollout cache 各跑至少 2 个 PPO epoch 和 10 个 actor train step；逐 step 比对 loss、KL、grad norm，并在最后比对参数。任何 NaN/Inf、shape 错误、指标明显发散或 checkpoint 恢复失败均为失败。
+5. **负向验收。** 覆盖功能关闭、`dp_size>1`、shuffle、动态 batching、非 G 整除、破损 group ID；每一种均应按设计走原路径或 fail-fast。
+6. **记录初测结果。** 将 off/on 数值表和性能表写入结果文档。此时即使性能未提升，也要提交，因为它将指导下一 Phase 的优化。
 
-**验收点：** 数值与梯度在容差内对齐；小训练稳定完成；性能报告可复现；所有限制均被明确验证。不得因为性能未提升而私自改为 direct-logprob 或扩展 DP>1，应先提交测量结果并单独决策。
+**验收点：** 精度门槛全部通过，且初始性能数据可复现。精度未对齐时，定位 position IDs、mask、prefix-last、restore scatter 或 loss mask，修复后重新执行本 Phase；不得开始性能优化。
 
-**提交：** 仅提交测试、结果文档、示例配置和必要修复。提交信息建议：`test: validate ROLL PrefixGrouper DP1 MVP`。
+**提交：** 仅提交基准脚本、fixture、数值结果和精度修复。提交信息建议：`test: establish ROLL PrefixGrouper acceptance benchmark`。
 
-### Phase 4：最终复查与停止条件
+### Phase 4：性能归因与 MVP 范围内优化
 
-**目标：** 形成一个可 review 的 MVP 分支，而不是继续扩大功能。
+**目标：** 在保持 Phase 3 精度对齐的前提下，消除 PrefixGrouper 接入层的主要开销，直到达到最终性能门槛；本 Phase 不是只做测量，而是“测量—改动—回归”的闭环。
 
-1. 检查每个 Phase 均有独立 commit、测试记录和对应结果；工作区干净。
-2. 对比 `use_prefix_grouper=false` 的原行为，确认默认配置零回归。
-3. 整理后续版本的候选项：DP>1 group-aware balance、group-aware shuffle/dynamic batching、direct logprob restore、LoRA/多模态；只记录为 issue/后续计划，不在本分支实施。
-4. 推送最终分支，准备两个独立 review：PrefixGrouper adapter review 与 ROLL hook review。
+1. **建立分段 profile。** 对 Phase 3 固定 workload 的 off/on 分别采样，拆出 data preparation、group build/concat、attention forward、logits restore、logprob/loss、backward、optimizer 的时间和峰值显存。使用 PyTorch profiler/NVTX 或等价工具，保存 trace/表格；先确认共享 prefix 的 attention token 量确实下降。
+2. **按证据选择一个优化。** 仅优化 profile 排名前二的、属于 MVP 接入层的问题。允许的优化包括：缓存不会随 micro-batch 改变的 group 索引/position 模板；在 GPU 上向量化 concat/restore，去除 Python per-row loop 和不必要的 CPU 同步；缩小 restore/scatter 到 loss 所需的 response-logit 区域；复用 attention patch 的静态状态。每次只做一种优化，禁止凭感觉同时重写多处。
+3. **每次改动后的双重回归。** 运行 Phase 1 单测、Phase 2 smoke test 和 Phase 3 的单步精度对齐；只有精度仍通过，才运行 30-step 性能基准。记录改动前后各分段耗时与 end-to-end p50，不达预期则回退该优化或保留为独立实验 commit，不带入下一项。
+4. **禁止的捷径。** 不得为获得速度改变 actor objective、跳过 response token、使用近似 logprob、关闭梯度、移除 restore 但又让现有 loss 读取不完整 logits，或扩大到 DP>1/动态 batching/LoRA。若 profile 证明这些是唯一瓶颈，只记录为下一版本议题，当前 MVP 仍应在允许范围内继续优化或明确无法达标。
 
-**验收点：** 所有 Phase 0–3 的验收项已满足，且未引入任何非 MVP 代码。达到此点即停止开发；未来通用版本从新的分支/PR 开始。
+**验收点：** 在固定 workload 上，开启 `use_prefix_grouper=true` 的完整 actor train-step p50 相比关闭开关至少提升 **10%**（`p50_on <= 0.90 × p50_off`）；p90 不得比 baseline 慢超过 5%；peak allocated memory 不得增加。并且 Phase 3 的全部精度比对仍通过。若未达标，继续本 Phase 的 profile—优化循环，不能进入最终收尾。
 
-**提交：** 如只含文档/结果，可提交 `docs: finalize ROLL PrefixGrouper DP1 MVP`；若无新增内容则不制造空提交。
+**提交：** 每项被保留的优化独立提交并附 profile/benchmark 结果，例如 `perf: vectorize PrefixGrouper logits restore`；被放弃的实验不得混入最终功能提交。
+
+### Phase 5：最终复查与停止条件
+
+**目标：** 仅在“精度对齐 + 性能提升”同时达成时形成可 review、可上游化的 DP=1 MVP 分支。
+
+1. 从干净 checkout 重新运行 Phase 3 的完整基准；确认结果不是 warm cache、偶然波动或先前进程残留造成的。保存命令、环境、原始测量数据和摘要表。
+2. 复查 Phase 3 的单步与短训练精度结果，以及 Phase 4 的性能结果；明确列出 off/on 的 p50、p90、显存和加速比。
+3. 对比 `use_prefix_grouper=false` 的默认行为，确认原路径零回归；确认所有非 MVP 配置均被明确 fail-fast。
+4. 整理后续候选项：DP>1 group-aware balance、group-aware shuffle/dynamic batching、LoRA/多模态等；只记录为 issue/后续计划，不在本分支实施。
+5. 推送最终分支，准备两个独立 review：PrefixGrouper adapter review 与 ROLL hook review。
+
+**最终终止条件：** 同一冻结 workload 上，开关 on/off 的 Phase 3 精度验收全部通过，且开关 on 达到 Phase 4 的端到端 p50 至少 10% 加速、p90 不退化超过 5%、peak allocated memory 不增加。任一条件不满足，本开发计划**不终止**，回到 Phase 3（精度问题）或 Phase 4（性能问题）继续迭代；不得以“能运行”或“仅有理论 token 节省”替代该结论。
+
+**提交：** 如只含最终结果与文档，可提交 `docs: finalize ROLL PrefixGrouper DP1 MVP benchmark`；若无新增内容则不制造空提交。
 
 ## 5、当前结论
 
