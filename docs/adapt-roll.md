@@ -8,7 +8,7 @@
 
 本适配的目标是为 ROLL 的 **固定 prompt、多 completion 的 GRPO/RLVR** 训练路径提供 PrefixGrouper 的 shared-prefix forward：每个 prompt 在每层只计算一次，随后让同组 completion 的 suffix attention 复用该 prompt 的 K/V。它与推理侧 prefix caching、以及面向任意前缀树的 PrefixSharing 不同。
 
-本项目仅考虑 ROLL + FSDP2 + PrefixGrouper：第一阶段只支持文本 causal LM 的 actor 路径、FSDP2 与固定 prompt 的 GRPO/RLVR。首个可运行 PoC 为单 DP rank，设计同时规定后续 DP=2 的 group-preserving 调度；动态 batching、sequence packing、多模态、LoRA/reference 与 agentic 任意长度轨迹均不在当前调研、设计或开发范围内。
+本项目当前只实现 ROLL + FSDP2 + PrefixGrouper 的 **DP=1 MVP**：纯文本 causal LM actor、固定 prompt 的 GRPO/RLVR、静态 batch、连续 group。DP>1 的 group-preserving 调度、动态 batching、sequence packing、多模态、LoRA/reference 与 agentic 任意长度轨迹均只作为未来扩展，不在当前开发范围内。
 
 ### 1.2 PrefixGrouper 的现有契约
 
@@ -46,12 +46,12 @@ ROLL 的 actor loss 使用完整 `input_ids` 与 `response_mask[:, 1:]` 计算 l
 | 落点 | 当前代码事实 | PrefixGrouper 责任 |
 | --- | --- | --- |
 | rollout 后数据契约 | `roll/utils/functionals.py:postprocess_generate()` 已把 prompt + completion 规范为 right-padded `input_ids`、`attention_mask`、`prompt_mask`、`response_mask`；同一 prompt 的 `n` 条 completion 此时连续。 | 创建并持久化稳定 group ID、组内序号和期望组大小；这里只产出普通 ROLL batch，不构造 PrefixGrouper。 |
-| 训练前 DP 调度 | `roll/pipeline/rlvr/rlvr_pipeline.py` 在 actor `train_step` 前调用 `batch_balance()`；现实现按单条 sequence 的 workload 重排，scheduler 随后连续切片给 DP rank。 | 用“完整 group 为原子”的 `group_balance()` 替换 actor train 的这一次调用，使每 rank 取得完整 group 的连续区间。 |
-| actor mini-batch 调度 | `roll/pipeline/base_worker.py:ActorWorker.train_step()` 的 `DataProto.make_iterator(..., shuffle=True)` 按 row shuffle；`FSDP2TrainStrategy.train_step()` 又按 `per_device_train_batch_size` 按 row 切分。 | 两处均改为 group-aware shuffle/iterator，保证每一个 FSDP2 micro-batch 都含完整 group。 |
+| 训练前调度 | `roll/pipeline/rlvr/rlvr_pipeline.py` 在 actor `train_step` 前调用 `batch_balance()`；即使 `dp_size=1`，它仍可能按 sequence 长度重排。 | MVP 启用时跳过该 actor train 的 `batch_balance()`；DP=1 不需要负载均衡，保留 rollout 的连续 group 顺序。 |
+| actor mini-batch 调度 | `roll/pipeline/base_worker.py:ActorWorker.train_step()` 的外层 iterator 使用 `shuffle=True`；内层 FSDP2 再按 `per_device_train_batch_size` 切分。 | MVP 禁用外层 row shuffle，并校验所有 batch size 都是 group size `G` 的整数倍；因而内层连续切分不会拆 group。 |
 | FSDP2 前向入口 | `roll/distributed/strategy/fsdp2_strategy.py` 的 `forward_step()`（无梯度 logprob）和 `FSDP2TrainStrategy.train_step()`（带梯度训练）最终均调用 `_fsdp2_forward(input_ids, attention_mask, position_ids, forward_args)`。 | 在此将普通 rows 转为 grouped input、调用带 `prefix_grouper` 的 HF 模型、恢复原 ROLL logits；两条路径必须复用同一个 helper。 |
 | 既有 actor loss | `roll/pipeline/rlvr/actor_worker.py:loss_func()` 使用 `op_compute_log_probs()` / `op_compute_entropy()` 消费完整 `input_ids` 与 logits。 | grouped 输出先恢复成原 `[N,S,V]` layout，使 GRPO/KL/ratio/entropy 代码无感知。 |
 
-模型加载也是前置落点：`roll/models/model_providers.py:load_model()` 在实例化 HF 模型前设置 `config._attn_implementation`，而 `ModelArguments.attn_implementation` 当前只接受 `sdpa/fa2/auto`。适配必须在模型实例化前注册 `prefix_grouper_attention` 并选择它；FSDP2 包装完成后再改 config 不会改变已创建 decoder layer 的 attention 实现。
+MVP 不修改模型加载或 `attn_implementation`。仿 verl，在 ROLL adapter 中 monkey-patch Transformers 的现有 attention function：每次调用从 kwargs 取可选的 `prefix_grouper`；没有时原样调用 attention，有时才进入 PrefixGrouper。这样原模型配置和 baseline 路径完全不变。
 
 ### 1.5 调度与并行约束
 
@@ -59,8 +59,8 @@ ROLL 的 actor loss 使用完整 `input_ids` 与 `response_mask[:, 1:]` 计算 l
 
 1. **范围：** 仅 `fsdp2_train` actor、纯文本 `AutoModelForCausalLM`、`cp_size=1`、无多模态和 LoRA。reference/critic 保持 ROLL 基线；本功能只优化 actor 的 `compute_log_probs` 与 actor training forward。
 2. **完整 GRPO group：** 同 group 的有效 prompt token 与 `prompt_mask` 必须完全一致；group 至少有 2 条、每条至少有 1 个 response token。MVP 要求所有 group 的大小固定为 `G=num_return_sequences_in_group`；被过滤样本只能经 `final_response_mask` 置零，不能删除 row。
-3. **可整除：** 每 DP rank 的 `per_device_train_batch_size=M` 必须满足 `M % G == 0`；全局 actor train batch 能按 `dp_size` 均分且每份均为 `G` 的整数倍。每一个 gradient-accumulation micro-step 独立满足此条件。
-4. **group 原子性：** `batch_balance`、scheduler 的 rank 分发、PPO epoch shuffle、FSDP2 mini-batch 切分都必须以 group 为单位，不能在末端临时 regroup。
+3. **DP=1 与可整除：** `dp_size=1`；`per_device_train_batch_size=M`、外层 backward batch size、`infer_batch_size` 都必须满足 `% G == 0`。每一个 gradient-accumulation micro-step 独立满足此条件。
+4. **连续 group：** rollout 输出后保留连续 group 顺序；actor train 跳过 `batch_balance` 且外层 iterator `shuffle=False`。MVP 不实现 group-aware scheduler。
 5. **禁止冲突调度：** `use_dynamic_batching_in_train/infer=False`、`use_sequence_packing=False`。它们的 token-budget / packing 逻辑不认识 group 边界。
 6. **模型能力门槛：** 仅接纳验证过的 HF 模型族：模型 forward 必须把 `prefix_grouper` 传到每层 self-attention，支持 Transformers `AttentionInterface`，且使用 2D text `position_ids`。3D M-RoPE、滑窗/特殊 attention、`output_attentions=True` 或自定义不透传 kwargs 的模型均回退。
 7. **统一回退：** 一个模型调用内不得混用 grouped 与普通 rows；数据不合格时整批走未修改的 `_fsdp2_forward()`，并记录 fallback 指标。
@@ -81,9 +81,9 @@ ROLL 的 actor loss 使用完整 `input_ids` 与 `response_mask[:, 1:]` 计算 l
 
 ```mermaid
 flowchart LR
-    A["ROLL rollout\n生成 G 条 [P][R] rows"] --> B["附加 group 元数据\ngroup_id / completion_index"]
-    B --> C["group-aware 调度\nDP 分发和 mini-batch 不拆 group"]
-    C --> D["FSDP2 adapter\n从 G 条 rows 构建 PrefixGroupLayout"]
+    A["ROLL rollout\n生成连续的 G 条 [P][R] rows"] --> B["保留 prefix_group_id\n不重排、不 shuffle"]
+    B --> C["DP=1 静态 mini-batch\nbatch size 是 G 的整数倍"]
+    C --> D["FSDP2 adapter\n从连续 G 条 rows 构建 PrefixGrouper"]
     D --> E["PrefixGrouper transform\n[P][R0], [P][R1] → [P][R0][R1]"]
     E --> F["HF model + PrefixGrouper attention\n每层 P 只 forward 一次"]
     F --> G["restore logits\n恢复为原始 G 条 [N,S,V] layout"]
@@ -101,24 +101,18 @@ attention 内部语义:   P→P 一次；Rj 只看 P + 自己的 Rj
 恢复后的 logits:      logits([P][R0]), logits([P][R1]), logits([P][R2])
 ```
 
-因此开发工作分成四个连续阶段：先**记住哪些 row 属于一组**，再**保证调度不拆组**，随后**在 FSDP2 forward 压缩/执行/恢复**，最后让既有 loss 像没有改动一样消费恢复后的 logits。任一阶段缺失都会导致前缀无法复用或 loss 不正确。
+因此 MVP 只有三项关键工作：保留 group ID、禁止会打散连续 group 的重排/shuffle、在 FSDP2 forward 压缩/执行/恢复。既有 loss 像没有改动一样消费恢复后的 logits。
 
 ### 2.2 开发清单：需要改动或新增的代码
 
 | 位置 | 文件 | 主要类/函数 | 为什么需要改 |
 | --- | --- | --- | --- |
-| PrefixGrouper | `src/prefix_grouper/utils/register_transformers.py` | `_prefix_grouper_attention_forward()` | 为 `prefix_grouper=None` 增加 baseline fallback；否则启用 custom attention 后普通 batch 与 fallback batch 都会失败。 |
-| PrefixGrouper | `integrations/roll/layout.py`（新增） | `PrefixGroupLayout`、`build_layout()` | 从 ROLL 普通 rows 识别一个完整 group，并验证 prompt 一致、response 非空等条件。 |
-| PrefixGrouper | `integrations/roll/transform.py`（新增） | `make_grouped_inputs()`、`make_grouped_position_ids()` | 调 `concat_input()` 生成 `[P][R0][R1]...`，并为每个 response 段重置 position IDs。 |
-| PrefixGrouper | `integrations/roll/restore.py`（新增） | `restore_logits()` | 调 `split_output(include_prefix_last=1)`，把 grouped logits 可微地还原为 ROLL 的 `[N,S,V]`。 |
-| PrefixGrouper | `integrations/roll/sampler.py`（新增） | `group_balance()`、`iter_group_minibatches()` | group 为原子完成 DP 负载均衡、PPO shuffle 和 mini-batch 切分。 |
-| ROLL | `roll/configs/worker_config.py` | `PrefixGrouperConfig`、`WorkerConfig.prefix_grouper` | 给 YAML 提供显式开关、group size、fallback 与 backend 配置；默认关闭。 |
-| ROLL | `roll/configs/model_args.py` | `ModelArguments.attn_implementation` | 允许配置 `prefix_grouper_attention`。 |
-| ROLL | `roll/models/model_providers.py` | `load_model()` | 必须在 HF 模型构造前注册 attention 并设置 `_attn_implementation`。 |
-| ROLL | `roll/utils/functionals.py` | `postprocess_generate()`、`group_balance()` | rollout 后写入稳定 group metadata；新增 group-aware balance，旧 `batch_balance()` 不改。 |
-| ROLL | `roll/pipeline/rlvr/rlvr_pipeline.py` | actor train 前的 balance 调用 | 开关启用时选择 `group_balance()`，否则保持 `batch_balance()`。 |
-| ROLL | `roll/pipeline/base_worker.py` | `ActorWorker.train_step()` | 外层 PPO iterator 由 row shuffle 改为 group shuffle。 |
-| ROLL | `roll/distributed/strategy/fsdp2_strategy.py` | `forward_step()`、`FSDP2TrainStrategy.train_step()`、`_prefix_grouper_forward()`（新增） | 两种 actor forward 都必须走同一“构建 layout → grouped model → restore logits”路径；替换按 row 的 chunk/iterator。 |
+| ROLL | `roll/utils/prefix_grouper.py`（新增） | attention monkey-patch、`build_pg_from_micro_batch()`、`forward_with_prefix_grouper()` | MVP 的唯一 adapter：从连续 rows 构建 PrefixGrouper、生成 position IDs、做 grouped forward、恢复 logits。没有 `prefix_grouper` 时 monkey-patch 必须调用原 attention。 |
+| ROLL | `roll/utils/functionals.py` | `postprocess_generate()` | 在现有重复的 `prompt_id` 基础上保存 `prefix_group_id`；后续即使内部 `prompt_id` 被重设/移除，MVP 仍能识别 group。 |
+| ROLL | `roll/pipeline/rlvr/rlvr_pipeline.py` | actor train 前的 `batch_balance()` 调用 | 开关启用且 DP=1 时跳过该调用，避免它打乱连续 group。 |
+| ROLL | `roll/pipeline/base_worker.py` | `ActorWorker.train_step()` | 开关启用时以 `shuffle=False` 创建外层 iterator，并校验 outer batch size `% G == 0`。 |
+| ROLL | `roll/distributed/strategy/fsdp2_strategy.py` | `forward_step()`、`FSDP2TrainStrategy.train_step()` | 两条 actor forward 调同一个 adapter；校验 micro-batch size `% G == 0`，再用其返回的 restored logits 调用原 loss。 |
+| ROLL | 配置与示例 | 一个 `use_prefix_grouper: false` 开关 | 可先置于 actor 的现有 `strategy_config`，避免为 MVP 新建 config/model-provider 改动；默认关闭。 |
 
 明确不改：`roll/pipeline/rlvr/actor_worker.py:loss_func()`、reward/advantage 计算、reference/critic worker、optimizer。它们依然接收原 row 顺序的 batch 和 logits。
 
@@ -134,89 +128,37 @@ attention 内部语义:   P→P 一次；Rj 只看 P + 自己的 Rj
 
 #### 2.3.2 配置、模型加载与 attention fallback
 
-在 ROLL `WorkerConfig` 增加结构化 `PrefixGrouperConfig`，不使用无类型的 `strategy_config`：
+MVP 只增加 `use_prefix_grouper: false` 和可选 `prefix_grouper_attn_func: flash_attention_2`，可先放到 actor 既有 `strategy_config`，不新建 config dataclass，也不改 model loader。
 
-```yaml
-prefix_grouper:
-  enabled: false
-  group_size: null                 # null 时读取 RLVRConfig.num_return_sequences_in_group
-  attention_backend: flash_attention_2
-  on_ineligible_batch: fallback    # MVP: fallback；error 仅调试使用
-  require_model_support: true
-```
+adapter 初始化时 monkey-patch Transformers 当前使用的 attention function，包装逻辑只有三步：从 kwargs 取并移除 `prefix_grouper`；它为 `None` 时原样调用原函数；它存在时用 `AttentionForward` 调 PrefixGrouper。这与 verl 的路线相同，因此无需把模型 `_attn_implementation` 改成新名字，也无需修改 PrefixGrouper 的核心 `register_transformers.py`。
 
-actor worker `initialize()` 必须在模型构造前按此顺序执行：
+启用时只校验：FSDP2、DP=1、`cp_size=1`、静态 batching、纯文本、无 LoRA，且目标模型能把 kwargs 传至 attention。先用一个普通 batch 证明 monkey-patch 的 baseline logits 不变，再用一个 grouped batch 证明每层收到 `prefix_grouper`。
 
-1. 校验 FSDP2、`cp_size==1`、静态 batching、无 LoRA/多模态；不通过时 `enabled=true` 直接报配置错误，不得静默关闭。
-2. 调用 `prefix_grouper.utils.register_transformers.register_attention()`，确认 Transformers 有 `AttentionInterface`、指定的 base attention backend 可用。
-3. 扩展 `ModelArguments.attn_implementation` 接受 `prefix_grouper_attention`，并让 `load_model()` 在 `from_pretrained()` 前设置 `config._attn_implementation`。`attention_backend` 经 model kwargs 传入已注册 adapter。
-4. 模型加载后、训练开始前运行小 capability probe：baseline forward 和带 `prefix_grouper` forward 都成功，且每层 self-attention 实际进入注册 adapter。probe 失败时 `require_model_support=true` 直接失败，禁止以“注册成功”推断模型透传了参数。
+#### 2.3.3 连续 group 标识与构建
 
-首个实现必须固定一个纯文本 HF 模型族和 Transformers 版本，并记录在兼容矩阵中；不可宣称所有 `AutoModelForCausalLM` 自动支持。
+MVP 只新增一个 tensor 字段 `prefix_group_id[N]`：在 `postprocess_generate()` 复制原始 prompt 的 `prompt_id` 时一并写入。RLVR pipeline 后续会重设并移除工作用的 `prompt_id`，但**不得**重设或移除 `prefix_group_id`。不需要 `completion_index`、`group_size`、`eligible` 等字段。
 
-**必须先补齐 attention fallback。** 现有 `src/prefix_grouper/utils/register_transformers.py` 的 `_prefix_grouper_attention_forward()` 将 `prefix_grouper` 声明为必填参数。因此一旦把模型的 `_attn_implementation` 设为 `prefix_grouper_attention`，普通 baseline forward 会因缺参失败。实现时必须将其改为 `Optional[PrefixGrouper] = None`：为 `None` 时原样调用 `ALL_ATTENTION_FUNCTIONS[prefix_grouper_attn_func]`，并保留原 `attention_mask`；非 `None` 时才走 `AttentionForward`。这是“功能关闭/mini-batch fallback 仍等价 baseline”的必要条件，不能留给 capability probe 兜底。
-
-#### 2.3.3 group metadata 与 `PrefixGroupLayout`
-
-`postprocess_generate()` 仍生产原始 ROLL batch，但新增以下只描述关联、不改张量数值的字段：
-
-| 字段 | 位置 | 定义 |
-| --- | --- | --- |
-| `prefix_group_id` | `non_tensor_batch`，每 row 一个不可变 ID | 同一原始 prompt 的 completion 相同；来自 rollout request 的稳定 sample/prompt UUID，不能使用会被重排的行号。 |
-| `prefix_completion_index` | `batch[N]` int64 | 原始 group 内 completion 次序，范围 `0..G-1`。 |
-| `prefix_group_size` | `batch[N]` int64 | 期望 completion 数；MVP 全部等于 `G`。 |
-| `prefix_grouper_eligible` | `batch[N]` bool | rollout 后初步资格；每个 mini-batch 仍须复核。 |
-
-不能依据“相邻 G 行”猜 group：`batch_balance()`、PPO epoch 与 `DataProto.reorder()` 都会重排。新增字段必须随 `DataProto.reorder/chunk/union` 移动；无法保证此行为的异步/agentic 路径不纳入 MVP。
-
-adapter 在每个 FSDP2 mini-batch 构造局部 `PrefixGroupLayout`：
+DP=1 且禁用 balance/shuffle 后，每个 group 保持连续，因此 adapter 只需读取 `prefix_group_id` 的连续 runs：
 
 ```text
 普通 ROLL rows                         grouped 模型输入
 g0: [P][R0], [P][R1], [P][R2]   ->    [P][R0][R1][R2]
 g1: [Q][S0], [Q][S1], [Q][S2]   ->    [Q][S0][S1][S2]
 
-layout = {row_indices, prompt_lens, response_lens, group_info, original_sequence_length}
+run = {start_row, end_row, group_id}; run length 必须等于配置 G
 ```
 
-构造步骤固定如下：
+`build_pg_from_micro_batch()` 依次验证每 run 长度为 G、同 run 的 `prompt_mask/input_ids` 相同、每条 response 非空；之后直接仿 verl 用第一行 prompt、全部 response mask 调 `PrefixGrouper.from_ungrouped_masks()`。失败即报配置/数据错误；MVP 不做复杂 fallback 混排。
 
-1. 按 `prefix_group_id` 聚合、按 `prefix_completion_index` 排序，验证每组恰有 `G` 个唯一 index。
-2. 取每组首 row 的 `input_ids`/`prompt_mask` 为 prefix，逐 row 比较所有有效 prompt token 和 mask；任何差异均使整个 mini-batch 不合格。
-3. 每 row 用 `input_ids`/`response_mask` 取 suffix；response 可变长但不得为零。
-4. 用 `PrefixGrouper.from_ungrouped_masks(prefix_mask, suffix_mask, group_sizes=G, padding_mode="right")` 创建对象，再用 `concat_input()` 得到 grouped `input_ids`。grouped attention mask 必须用 `prefix_grouper.padding_mask`，不得复用原 row mask。
+#### 2.3.4 DP=1 顺序 guard 与 iterator
 
-推荐的数据结构和返回契约如下；future Agent 可以调整模块路径，但不要删减这些信息：
+名称保留为“调度”，但 MVP 不新建 scheduler、sampler 或 `group_balance()`。只实施三个 guard：
 
-```python
-@dataclass(frozen=True)
-class PrefixGroupLayout:
-    row_indices: list[list[int]]       # grouped row -> 原 mini-batch row；组内按 completion_index 排序
-    prompt_lens: Tensor                # [num_groups]
-    response_lens: Tensor              # [num_rows]，顺序与 flatten(row_indices) 一致
-    group_size: int                    # MVP 中固定为 G
-    original_shape: tuple[int, int]    # 原 rows 的 (N, S)
-    grouper: PrefixGrouper
+1. 要求 `dp_size == 1`，并跳过 actor train 前的 `batch_balance()`；
+2. 外层 PPO iterator 改为 `shuffle=False`；
+3. 校验 `infer_batch_size`、`per_device_train_batch_size`、外层 backward batch size 都能被 `G` 整除。
 
-@dataclass(frozen=True)
-class LayoutBuildResult:
-    layout: PrefixGroupLayout | None
-    reason: str | None                 # 例如 prompt_mismatch / response_empty
-```
-
-普通数据不合格必须通过 `LayoutBuildResult.reason` 触发 fallback，而不是抛异常；只有配置错误或程序不变量损坏才抛异常。这样 metrics 可以统计 `missing_group_id`、`group_size_mismatch`、`prompt_mismatch`、`response_empty`、`max_position_exceeded` 等具体原因。
-
-#### 2.3.4 group-aware 调度与 iterator
-
-在 ROLL functionals 层新增纯函数 `group_balance(batch, dp_size, rows_per_rank, group_key)`，仅替换 RLVR actor train 路径中的 `batch_balance()`；其他 worker 默认行为保持不变。
-
-1. 从稳定字段恢复 groups，验证每组行数均为 `G`。
-2. 以 group 为单位计算 workload：MVP 可复用 ROLL 的 `24576*L+L^2`，但 group workload 必须为每个 completion `L_prompt+L_response_j` 的 workload 之和；记录每个 DP rank 的统计。
-3. 用确定性 greedy bin-packing 分配完整 groups 至 `dp_size` 个 bins，硬约束为每 bin 正好 `rows_per_rank` 行。无可行解即配置错误，绝不拆组。
-4. 每 bin 内将完整 groups 连续展平，再调用已有 `batch.reorder(global_idx)`；scheduler 的连续等份切片因而自然获得完整 groups。
-5. actor worker 每个 PPO epoch 先 shuffle group 列表、后展开 rows；每一训练 mini-batch 精确含 `M/G` 个 groups。`FSDP2TrainStrategy.train_step()` 不得再使用按 row 的 `make_iterator()`，而是使用同一 group-aware iterator。
-
-actor `compute_log_probs` 的 inference micro-batch 也必须采用此切分；否则 old-logprob recompute 与 training 会产生不同的资格和恢复语义。reference/critic 保持 baseline，可继续使用原 `batch_balance()`。
+因此 ROLL 的连续 row 切分天然按完整 group 边界切开。未来若支持 DP>1、shuffle 或 dynamic batching，才新增 group-aware balance/sampler；它们不属于 MVP。
 
 #### 2.3.5 FSDP2 grouped forward 与 logits restore
 
@@ -229,30 +171,25 @@ def _prefix_grouper_forward(self, data: DataProto) -> torch.Tensor:
 
 `forward_step()` 与 `FSDP2TrainStrategy.train_step()` 必须在各自现有的 autocast/no-sync 上下文中调用它；helper 不创建 `no_grad`、autocast、FSDP context，也不调用 backward。流程固定为：
 
-1. 未启用或 layout 校验失败时调用原 `_fsdp2_forward()`；`on_ineligible_batch=error` 时抛出包含 group ID 的诊断错误。
+1. 未启用时调用原 `_fsdp2_forward()`；启用时连续 run 校验失败直接报错（MVP 不做混排 fallback）。
 2. 构造 grouped `input_ids` / `attention_mask`。一组实际 layout 为 `[P][R0][R1]...`，长度为 `len(P)+Σlen(Rj)`，必须先校验不超过 model max position length。
 3. 重新生成 2D grouped `position_ids`：prefix 为 `0..len(P)-1`；每段 suffix 都从 `len(P)` 重新编号。不得对 grouped attention mask 直接 `cumsum`，否则第二个 suffix 的 RoPE position 错接在第一个 suffix 之后。
 4. 复制 `forward_args`（禁止原地污染 batch），强制 `use_cache=False`，加入 `prefix_grouper` 与 `prefix_grouper_attn_func`，调用 `self.model(...).logits`。每层必须收到同一 `PrefixGrouper` 实例。
 5. 调 `split_output(grouped_logits, include_prefix_last=1)`。对 completion `j` 保留 `suffix_logits[j, :response_len_j]`：第 0 个即 prefix 最后 token 对首个 response token 的预测；末尾额外的 next-token/padding logit 丢弃。
-6. 分配零填充 `restored_logits[N,S,V]`，按 `layout.row_indices` 将结果 scatter 至原 row 的 `[prompt_len-1 : prompt_len+response_len-1]`。这正是 ROLL 对 `input_ids[:,1:]` shift 后、`response_mask[:,1:]` 会消费的 logit 位置。
+6. 分配零填充 `restored_logits[N,S,V]`，按连续 run 将结果 scatter 至原 row 的 `[prompt_len-1 : prompt_len+response_len-1]`。这正是 ROLL 对 `input_ids[:,1:]` shift 后、`response_mask[:,1:]` 会消费的 logit 位置。
 7. 返回 restored logits。它的 batch 顺序与 `[N,S]` shape 必须和原 `input_ids` 完全一致，故 `op_compute_log_probs()`、`op_compute_entropy()` 与 `ActorWorker.loss_func()` 不修改。
 
 该 helper 的调用骨架应保持下面的结构，尤其是 fallback 必须调用原 `_fsdp2_forward()`：
 
 ```python
 def _prefix_grouper_forward(self, data: DataProto) -> Tensor:
-    result = build_layout(data, group_size=self.prefix_grouper_cfg.group_size)
-    if result.layout is None:
-        return self._fsdp2_forward_from_original_data(data)  # 原 input/mask/position/args
-
-    grouped = make_grouped_inputs(result.layout, data)
+    pg_batch = build_pg_from_micro_batch(data, group_size=G)  # 连续 run → PrefixGrouper + grouped inputs
     logits = self.model(
-        **grouped,
+        **pg_batch.model_inputs,
         use_cache=False,
-        prefix_grouper=result.layout.grouper,
-        prefix_grouper_attn_func=self.prefix_grouper_cfg.attention_backend,
+        prefix_grouper=pg_batch.grouper,
     ).logits
-    return restore_logits(result.layout, logits, data.batch["input_ids"])
+    return restore_logits(pg_batch, logits, data.batch["input_ids"])
 ```
 
 `forward_step()` 的无梯度 logprob 路径和 `FSDP2TrainStrategy.train_step()` 的有梯度路径都调用此 helper；二者不能各自实现 transform/restore，否则极易发生 old-logprob 和训练 logprob 的对齐差异。
@@ -263,16 +200,15 @@ attention 算法仍在 PrefixGrouper：registered attention 对 prefix 只执行
 
 restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU 或使用丢失梯度的写入方式。验收时 suffix loss 对共享 prefix 的梯度必须等于 baseline 中 G 次独立 prefix forward 梯度之和。
 
-`PrefixGroupLayout` 仅为本次 forward 的局部变量，不能挂在 strategy 实例上，避免 PPO epoch、no-grad forward 或并发 future 复用过期 indices。允许记录无张量 metrics：eligible/fallback mini-batch 数、group size、原始/压缩有效 token 数、transform/restore 耗时。
+`pg_batch` 仅为本次 forward 的局部变量，不能挂在 strategy 实例上。允许记录无张量 metrics：group 数、group size、原始/压缩有效 token 数、transform/restore 耗时。
 
-配置不兼容在初始化 fail fast；数据不兼容按 `fallback/error` 处理。fallback 必须使用完全未修改的输入、position ids、forward args，并发出计数/告警，防止功能表面启用却长期未命中。
+配置或连续 run 不兼容时 fail fast，并打印 group ID 与长度；功能关闭时严格走完全未修改的原路径。
 
 ### 2.5 实施顺序与验收前置条件
 
-1. **ROLL：数据契约与 group-aware 迭代。** 改 `postprocess_generate()`、加入 `group_balance()` 和 group-aware iterator；默认关闭，不依赖 PrefixGrouper。
-2. **PrefixGrouper：ROLL adapter 库。** 新增 `integrations/roll/{capability.py,layout.py,transform.py,positions.py,restore.py}` 及单测；只依赖稳定 ROLL batch 字段，不 fork ROLL 源码。
-3. **ROLL：可选 FSDP2 hook。** 加 config、模型加载时 attention registration/选择、`fsdp2_strategy.py` 的唯一 grouped-forward helper；adapter 为可选依赖，默认严格 baseline。
-4. **集成验收。** 固定版本、固定模型和 rollout fixture 下通过 on/off 等价、FSDP2 backward、DP=2 group-preserving 和性能报告，再公开示例。
+1. **ROLL adapter。** 新增单文件 `roll/utils/prefix_grouper.py`，先完成 monkey-patch、连续 run 构建、position IDs 与 logits restore 的单测。
+2. **ROLL 最小 hook。** 保留 `prefix_group_id`，DP=1 时跳过 `batch_balance`，关闭 actor shuffle，并在 FSDP2 两条 forward 路径调用 adapter。
+3. **集成验收。** 固定模型与 rollout fixture 下完成 on/off 等价、FSDP2 backward 和性能报告。DP>1 不在本轮验收。
 
 #### 2.5.1 开发前必须完成的三个小实验
 
@@ -282,7 +218,7 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 2. **参数透传：** selected HF text model 的 `model(..., prefix_grouper=grouper)` 确实让每层 self-attention 收到同一对象；以计数 hook 证明，不能只看无异常。
 3. **单 batch 等价：** 不接 ROLL，直接用两组 `[P][R]` 合成 token batch，比对 baseline 与 transform → model → restore 的 response logprob、loss 和 parameter gradient。
 
-三个实验通过后，才将 adapter 接进 ROLL 的 metadata、group-aware 调度和 FSDP2 hook。这样能把“模型 attention 不兼容”和“ROLL 数据/调度错误”分离，显著降低排障成本。
+三个实验通过后，才将 adapter 接进 ROLL 的最小 metadata、DP=1 guard 和 FSDP2 hook。这样能把“模型 attention 不兼容”和“ROLL 数据顺序错误”分离，显著降低排障成本。
 
 ## 3、测试验证
 
@@ -292,7 +228,7 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 - batch transform：input_ids、attention mask、position ids、response/final_response mask、advantages、old/ref/infer logprobs 的 gather/scatter；
 - prefix-last 边界：completion 第一个 token 与不同 response 长度；
 - fallback：不满足条件时 byte-for-byte 保持 baseline batch；
-- group-aware partition：不跨 DP/micro-batch、可解释 workload 指标。
+- DP=1 guard：拒绝 `dp_size != 1`、shuffle、非 G 整除的 batch size 和被打散的连续 run。
 
 ### 3.2 数值等价测试（GPU）
 
@@ -307,7 +243,7 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 ### 3.3 集成测试
 
 1. 单卡 FSDP2 文本 GRPO smoke test；
-2. DP=2 group-preserving dispatch test；
+2. DP>1、动态 batching、shuffle 三类配置必须被明确拒绝；
 3. PrefixGrouper 关闭、无共享、配置不兼容三种回退；
 4. FSDP2 自动混精及不同 group size 的兼容性测试。
 
@@ -334,8 +270,8 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 - [ ] 实现 group map 与完整 batch transform/restore；
 - [ ] 添加 CPU 单测和不变量检查；
-- [ ] 实现 group-aware partition 原型；
-- [ ] 提交 ROLL 数据 hook RFC/小 PR。
+- [ ] 保留 `prefix_group_id`，并实现 DP=1 / no-shuffle guard；
+- [ ] 完成 ROLL 最小 hook PR。
 
 ### Phase 2：FSDP2 PoC
 
