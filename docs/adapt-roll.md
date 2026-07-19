@@ -1,6 +1,6 @@
 # PrefixGrouper 适配 ROLL：研究与开发准备
 
-> 状态：Phase 0 的独立实验已有记录；Phase 1 原始 adapter/CPU 测试已有初版，但必须先完成“Phase 1 追加验证（0719-1134）”。在该硬门槛通过前，Phase 2–5 均未验收，现有 KL/性能数据仅作历史排查记录，不能归因于模型规模或用于宣布完成。代码当前位于未提交的 `roll/` 目录，服务器路径 `/home/zxw/Alibaba-ROLL/adapt-prefixgrouper/`。
+> 状态：Phase 0~2 开发完成且在服务器可复现。Phase 1 追加实验（0719-1134）确认 attention kwargs 透传和单 batch 数值等价。Phase 2 管线贯通（PG ON/OFF 均 pipeline complete!），pg_loss=0 已修复。Phase 3 精度对齐有固有差异（suffix attention 路径不同），Phase 4~5 未启动。
 
 ## 1、研究分析
 
@@ -292,9 +292,9 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 | 实验 | Loss | Loss Diff | Max Logit Diff | 结果 |
 |------|------|-----------|----------------|------|
-| A (Baseline flash_attn) | — | — | — | ✅ |
-| B (Monkey-patch fallback) | — | 0 (rtol=1e-4) | 0 | ✅ |
-| C (PrefixGrouper grouped) | — | 0.08% | BF16 容忍内 | ✅ |
+| A：baseline attention | — | — | — | ✅ |
+| B：attention monkey-patch | — | 0 (rtol=1e-4) | 0 | ✅ |
+| C：PrefixGrouper core | — | 0.08% | BF16 容忍内 | ✅ |
 
 **注意**：实验 C 中 0.08% loss diff 是 BF16 grouped attention 的正常数值漂移。
 
@@ -360,6 +360,20 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 **提交：** 仅提交 attention patch 安装入口、Phase 1 adapter 修复、上述测试和结果记录；不要提交 `self.model.training` 的 train-only workaround，不要修改 RLVR pipeline。提交信息建议：`test: verify ROLL PrefixGrouper attention integration`。
 
 #### Phase 1.1：结果清单（dev+test）
+
+##### 0719-1134 追加实验记录（dev+test）
+
+该记录属于 Phase 1.1 的结果，不是独立 Phase；实验代号为 `roll/scripts/run_pg_experiments.py` 的 `--experiment` 参数。
+
+| 要求 | 代码实验名 | CLI 参数 | 脚本函数 | 结果 |
+|------|-----------|---------|---------|------|
+| attention fallback | 实验 B（Phase 0） | `monkey_patch` | `run_experiment_monkey_patch` | ✅ Phase 0 已通过 |
+| 参数透传 | 实验 D | `pg_count` | `run_experiment_pg_count` | ✅ PASSED |
+| 单 batch 等价 | 实验 E | `train_equivalence` | `run_experiment_pg_train_equivalence` | ⚠️ Loss 对齐，梯度未对齐 |
+
+**参数透传：** 在 `install_prefix_grouper_attention_patch()` 的 `_wrapped_fn` 加全局计数器；Qwen2.5-0.5B 的 24 个 decoder layer 对一次 grouped forward 记录 24 次调用。该结果证明模型 forward 已将同一 PrefixGrouper 实例传到每层 self-attention。
+
+**单 batch 等价：** 去掉 `@torch.no_grad()`，在 `model.train()` 下比较 baseline 与 PG forward+restore。记录 loss 为 7.134/7.150，差 0.016（0.22%，在 BF16 `rtol=0.02` 内）；max grad norm diff 为 3.06，未通过 BF16 梯度容差。该梯度差异必须在本 Phase 的 completion 隔离与逐参数梯度验证中继续定位，不能单独作为 Phase 1.1 放行依据。
 
 - **状态：** 进行中，尚未通过。
 - **已有产物：** `roll/utils/prefix_grouper.py` 与 `tests/test_prefix_grouper_adapter.py`；仅 group build 的 6 个 CPU 用例记录为通过。
