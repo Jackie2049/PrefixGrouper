@@ -331,51 +331,52 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **触发原因：** 现有 6 个 CPU 测试只覆盖 group 构建，不能证明真实 Transformers attention 已进入 PrefixGrouper 分支；现有 FSDP2 实现也没有在 worker 进程安装 attention patch。若 patch 未命中，拼接后的后续 completion 会通过普通 causal attention 读取前一 completion，所有数值、KL 和性能结果均无效。因此，本节是进入 Phase 2 前的硬门槛，不能以“模型可运行”替代任一项。
 
-**统一实验约束：** 使用单卡、`DP=1`、`CP=1`、Qwen2.5-0.5B-Instruct、`flash_attention_2`、固定 seed、`model.eval()`、关闭 dropout 与 `use_cache`。构造一个固定 group：相同 prompt `P`，至少两个 response `R1/R2`；所有比较只取 `response_mask[:, 1:]` 对应的有效 prediction logits/logprob，绝不比较 padding logits。测试文件应新增为 `tests/test_prefix_grouper_attention_integration.py`；每个测试将模型版本、seed、dtype、命令、最大绝对误差和最大相对误差写入可提交的结果文件。
+**统一实验约束与产物：** 使用单卡、`DP=1`、`CP=1`、Qwen2.5-0.5B-Instruct、`flash_attention_2`、固定 seed=42、`model.eval()`、`use_cache=False`；**梯度实验同样使用 `model.eval()`，只是不使用 `torch.no_grad()`，禁止使用 `model.train()`。** 固定 fixture 是相同 prompt `P` 的至少两个 response `R1/R2`；所有数值比较只取 `response_mask[:,1:]` 的有效 prediction logits/logprob，绝不比较 padding logits。新增 `tests/test_prefix_grouper_attention_integration.py`，其中必须有下列六个同名测试函数；每次完整运行后写 `tests/results/phase_1_2.json`，包含 git SHA、模型 revision、命令、dtype、fixture 形状、每项 pass、max_abs/max_rel 和实际 spy 计数。
 
-1. **先实现 worker 可调用的安装入口。** 在 adapter 中提供可重复调用的安装函数，并在测试中显式安装；为 wrapper 增加仅供测试读取的命中计数或 spy（区分 fallback 与 PG 分支）。安装两次不得改变原函数引用或重复包裹；卸载后必须恢复同一原函数引用。
+1. **P1.2-A：`test_p12_a_patch_lifecycle_and_fallback`（patch 生命周期与原路径回退）。** 先保存 `ALL_ATTENTION_FUNCTIONS["flash_attention_2"]` 原函数引用；安装两次、卸载一次、再安装一次。分别以未安装 patch 和已安装但不传 `prefix_grouper` 的普通 `model(**batch)` 得到 baseline/fallback。
 
-   **执行：** 在加载 Qwen 模型前保存 `ALL_ATTENTION_FUNCTIONS["flash_attention_2"]` 的引用；安装两次；卸载；断言恢复后的引用与初始引用相同。随后重新安装，用普通 `model(**batch)` forward（不传 `prefix_grouper`）运行一次。
+   **命令：** `pytest -q tests/test_prefix_grouper_attention_integration.py -k p12_a`。**断言：** 第二次安装不再包裹；卸载后函数引用与初始引用完全相同；普通 forward 的 PG 外层命中为 0；baseline/fallback 的有效 response logits 与 logprob `torch.equal`。失败只修 patch，不运行 B–F。
 
-   **通过条件：** patch 安装/卸载幂等；普通 forward 的 PG 命中计数为 0；其有效 response logits、response logprob 与未安装 patch 的 baseline 在 FP32 下 `rtol=1e-4, atol=1e-5` 内对齐。失败时只修 patch/fallback，不进入下一项。
+2. **P1.2-B：`test_p12_b_pg_reaches_every_decoder_layer`（逐层参数透传）。** 对同一 fixture 调用 `prefix_grouper_forward_from_data()`；spy 必须分别记录 `pg_outer_calls`、`plain_fallback_calls`、`delegate_calls` 和 `num_decoder_layers`，不能只保留一个总计数。
 
-2. **验证 PG attention 真正命中每个 decoder layer。** 对同一 batch 调用 `prefix_grouper_forward_from_data()`，并读取 spy。spy 至少记录：PG 分支命中总数、fallback 命中总数、模型 decoder layer 数。
+   **命令：** `pytest -q tests/test_prefix_grouper_attention_integration.py -k p12_b`。**断言：** `pg_outer_calls == num_decoder_layers`；外层 plain fallback 为 0；PrefixGrouper 为调用原 FlashAttention 产生的内部 delegate 单独计数且允许存在。失败停止，先修 kwargs/patch 安装。
 
-   **通过条件：** 外层 PG 分支命中数等于 decoder layer 数（或能由模型结构明确解释的每层 attention 调用数），而不是 0。PrefixGrouper 内部为调用原始 FlashAttention 而产生的委托调用允许发生，但 spy 必须将其与“不带 PG 的外层 fallback”分开统计。若外层 PG 命中为 0，禁止继续做任何 pipeline、KL 或性能实验，先修复 worker/strategy 的安装位置与 kwargs 透传。
+3. **P1.2-C：`test_p12_c_completion_isolation`（completion 隔离）。** 构造 A=`[P,R1,R2]` 与 B=`[P,R1',R2]`，只改变 `R1` token；分别跑 PG forward。另对单条 `[P,R2]` 跑普通 baseline forward。
 
-3. **验证“completion 之间完全隔离”的核心语义。** 固定 `P` 与 `R2`，构造 batch A=`[P][R1][P][R2]`；再仅替换 `R1` 的 token 得到 batch B。分别使用 PG forward 计算两组结果；另对 `[P][R2]` 单独运行普通 baseline forward。
+   **命令：** `pytest -q tests/test_prefix_grouper_attention_integration.py -k p12_c`。**断言：** A/B 中 `R2` 的每个有效 response logit 与 logprob 在 BF16 `rtol=2e-2, atol=2e-2` 内；PG 的 `R2` 与独立 baseline 同容差对齐。失败表明 suffix 串扰或 position/mask 错误，禁止进入 D–F。
 
-   **通过条件：** A/B 中 `R2` 的所有有效 prediction logits/logprob 在 FP32 容差内不变；PG 的 `R2` 有效 response logits/logprob 与独立 `[P][R2]` baseline 对齐。该测试专门防止普通拼接 causal attention 让 `R2` 读取 `R1`；任一失败均说明 attention patch/position/mask 语义错误。
+4. **P1.2-D：`test_p12_d_restore_token_mapping`（逐 token restore）。** 参数化两组 fixture：`G=2` 与 `G=4`；每组同时包含变长 prompt、变长 response、恰好 1 token response 和不同右 padding。逐条样本执行独立 baseline forward 与 grouped+restore forward。
 
-4. **验证 restore 的 token 映射与 autograd。** 为 `G=2` 和 `G=4` 分别构造：变长 prompt、变长 response、response 仅 1 token、不同 padding 长度。对每条样本逐 token 比较“独立 baseline forward”的有效 response logits 与 restore 后 logits；以相同 response-mask loss 反向，比较所有有梯度参数的梯度。
+   **命令：** `pytest -q tests/test_prefix_grouper_attention_integration.py -k p12_d`。**断言：** 对每个有效 response prediction logit/logprob 逐元素比较；显式断言“prompt 最后一个 logit → 首 response token”及每条 response 最后有效 token 均被覆盖。BF16 容差 `rtol=2e-2, atol=2e-2`；不得以平均 loss、全序列 max logit 或 padding 结果代替。
 
-   **通过条件：** 不得只比较平均 loss。FP32 下逐元素 response logits、loss、参数梯度均在 `rtol=1e-4, atol=1e-5` 内；BF16 下记录最大/平均误差，且 response logprob、loss、grad norm 在 `rtol=2e-2, atol=2e-2` 内。首个 response token（由 prompt 最后一个 logit 预测）和每条 response 最后一个有效 token 必须被断言覆盖。
+5. **P1.2-E：`test_p12_e_autograd_equivalence`（loss 与逐参数梯度）。** 复用 D 的 `G=2/4` fixture，`model.eval()` 且梯度开启；baseline 与 PG 分别 `zero_grad → forward → 同一 response-token cross-entropy mean → backward`。保存每个同名 parameter 的 gradient tensor，转 FP32 后逐元素比较；只比较 grad norm 的测试视为未实现。
 
-5. **验证真实 FSDP2 hook 的最小调用链。** 使用与 ROLL 相同的 FSDP2 actor 初始化方式，而不是只执行 `model.to("cuda")`。在 `FSDP2InferStrategy.forward_step()` 与 `FSDP2TrainStrategy.train_step()` 各喂入一次固定 DataProto，并读取同一 PG spy。
+   **命令：** `pytest -q tests/test_prefix_grouper_attention_integration.py -k p12_e`。**断言：** loss、每个 parameter gradient 的 `max_abs`、`max_rel`、relative-L2 均写入 JSON；使用 BF16 `rtol=2e-2, atol=2e-2` 做 `torch.testing.assert_close`。任何一个参数失败即 P1.2-E 失败；不得以“suffix 路径固有差异”放行，必须定位为 attention mask、position IDs、restore/scatter、loss reduction 或 kernel 数值差异之一。
 
-   **通过条件：** 两条策略路径均实际安装 patch 并命中 PG attention；forward 返回的 restored logits shape 为原 `[N,S,V]`；train path 成功 backward/optimizer step。此项只验证 hook 生效，暂不比较 old/ref logprob 或完整 RLVR pipeline——这些属于 Phase 2。
+6. **P1.2-F：`test_p12_f_real_fsdp2_hook`（真实 FSDP2 hook）。** 新增/改造 `roll/scripts/test_fsdp2_integration.py`，使用 ROLL 的真实 actor worker/strategy 初始化、固定 DataProto 和单卡 FSDP2；禁止用 `AutoModel...to("cuda")` 冒充 FSDP2。
 
-6. **记录与提交。** 将全部原始命令、模型 revision、环境版本、fixture token、断言容差、spy 计数、误差表保存到 `docs/` 或 `tests/results/`；测试在目标服务器环境中连续通过后再提交。
+   **命令：** `python roll/scripts/test_fsdp2_integration.py --phase p12_f --model Qwen/Qwen2.5-0.5B-Instruct`。**断言：** `FSDP2InferStrategy.forward_step()` 与 `FSDP2TrainStrategy.train_step()` 都安装 patch 且满足 B 的逐层命中；infer 输出为原 `[N,S,V]` restored layout；train 完成一次 backward 和 optimizer step。此实验只验证 hook，不测试 old/reference logprob 或完整 RLVR pipeline。
 
-**Phase 1.2 验收点：** 第 1–5 项全部通过，且测试证明“PG attention 已逐层命中、R2 不依赖 R1、restore 与梯度正确、真实 FSDP2 hook 生效”。此前的“6/6 CPU 测试通过”和 0.5B pipeline 记录仅保留为历史排查信息，不构成通过本追加验证的证据。
+**Phase 1.2 验收点：** A–F 全部通过、`tests/results/phase_1_2.json` 完整存在、所有命令返回 0，才可进入 Phase 2。此前的“6/6 CPU 测试通过”、24 次计数或单个 BF16 loss 结果均不构成放行证据。
 
 **提交：** 仅提交 attention patch 安装入口、Phase 1 adapter 修复、上述测试和结果记录；不要提交 `self.model.training` 的 train-only workaround，不要修改 RLVR pipeline。提交信息建议：`test: verify ROLL PrefixGrouper attention integration`。
 
 #### Phase 1.2：结果清单（dev+test）
 
-##### 0719-1134 追加实验记录（dev+test）
+##### 0719-1134 历史实验记录（dev+test，不能替代 P1.2-A–F）
 
 该记录属于 Phase 1.2 的结果，不是独立 Phase；实验代号为 `roll/scripts/run_pg_experiments.py` 的 `--experiment` 参数。
 
-| 要求 | 代码实验名 | CLI 参数 | 脚本函数 | 结果 |
-|------|-----------|---------|---------|------|
-| attention fallback | 实验 B（Phase 0） | `monkey_patch` | `run_experiment_monkey_patch` | ✅ Phase 0 已通过 |
-| 参数透传 | 实验 D | `pg_count` | `run_experiment_pg_count` | ✅ PASSED |
-| 单 batch 等价 | 实验 E | `train_equivalence` | `run_experiment_pg_train_equivalence` | ⚠️ Loss 对齐，梯度未对齐 |
+| 对应新实验 | 旧实验名 | CLI 参数 | 旧结论 | 新判定 |
+|------------|---------|---------|--------|---------|
+| P1.2-A | 实验 B | `monkey_patch` | fallback 数值一致 | ⚠️ 缺生命周期引用断言 |
+| P1.2-B | 实验 D | `pg_count` | 24 layer 调用 | ⚠️ 缺三类 spy 计数 |
+| P1.2-E | 实验 E | `train_equivalence` | loss 对齐、grad 不齐 | ❌ 使用 `model.train()`，且只比 grad norm |
+| P1.2-C/D/F | — | — | 无记录 | ❌ 未执行 |
 
-**参数透传：** 在 `install_prefix_grouper_attention_patch()` 的 `_wrapped_fn` 加全局计数器；Qwen2.5-0.5B 的 24 个 decoder layer 对一次 grouped forward 记录 24 次调用。该结果证明模型 forward 已将同一 PrefixGrouper 实例传到每层 self-attention。
+**参数透传：** 在 `install_prefix_grouper_attention_patch()` 的 `_wrapped_fn` 加全局计数器；Qwen2.5-0.5B 的 24 个 decoder layer 对一次 grouped forward 记录 24 次调用。这是 B 的积极证据，但仍须补齐 outer/fallback/delegate 三类计数。
 
-**单 batch 等价：** 去掉 `@torch.no_grad()`，在 `model.train()` 下比较 baseline 与 PG forward+restore。记录 loss 为 7.134/7.150，差 0.016（0.22%，在 BF16 `rtol=0.02` 内）；max grad norm diff 为 3.06，未通过 BF16 梯度容差。该梯度差异必须在本 Phase 的 completion 隔离与逐参数梯度验证中继续定位，不能单独作为 Phase 1.2 放行依据。
+**单 batch 等价：** 旧实验去掉 `@torch.no_grad()` 后却使用 `model.train()`，记录 loss 为 7.134/7.150、max grad norm diff 为 3.06。该实验不符合 P1.2-E 的 eval-mode 与逐参数 tensor 比较口径，必须重写，不能把梯度差异宣称为固有差异或作为 Phase 1.2 放行依据。
 
 - **状态：** 进行中，尚未通过。
 - **已有产物：** `roll/utils/prefix_grouper.py` 与 `tests/test_prefix_grouper_adapter.py`；仅 group build 的 6 个 CPU 用例记录为通过。
