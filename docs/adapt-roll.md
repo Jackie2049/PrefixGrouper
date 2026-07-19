@@ -314,7 +314,9 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **提交：** 只提交 adapter 与其单测，不接触 FSDP2/pipeline。提交信息建议：`feat: add ROLL PrefixGrouper MVP adapter`。
 
-##### 既有开发记录（不构成验收结果）
+#### Phase 1.1：结果清单（dev+test）
+
+- **状态：** 基础 adapter 已实现，CPU group-build 用例通过；尚不代表真实 attention/FSDP2 集成通过。
 
 - **核心文件**：`roll/utils/prefix_grouper.py`（4 个模块）
   1. 幂等 attention patch：`install_prefix_grouper_attention_patch()` / `uninstall_prefix_grouper_attention_patch()`
@@ -325,7 +327,7 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 - **单测结果**：6/6 通过（连续 group 构建、prompt/response 分离、变长 response、合法 G=4、错误 group 拒绝、不匹配 prompt 拒绝）
 - **重要修复**：logits restore 从 `split_output(include_prefix_last=1)` 改为直接索引 `grouped_logits[g, offset-1 : offset-1+r_len]`，避免 `batch_repeat_cat` 导致的 prefix-last 错位。前缀 next-token 预测也已补全。
 
-##### 0719-1134 追加验证（Phase 1.1 必做）
+#### Phase 1.2：要求清单（design）
 
 **触发原因：** 现有 6 个 CPU 测试只覆盖 group 构建，不能证明真实 Transformers attention 已进入 PrefixGrouper 分支；现有 FSDP2 实现也没有在 worker 进程安装 attention patch。若 patch 未命中，拼接后的后续 completion 会通过普通 causal attention 读取前一 completion，所有数值、KL 和性能结果均无效。因此，本节是进入 Phase 2 前的硬门槛，不能以“模型可运行”替代任一项。
 
@@ -355,15 +357,15 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 6. **记录与提交。** 将全部原始命令、模型 revision、环境版本、fixture token、断言容差、spy 计数、误差表保存到 `docs/` 或 `tests/results/`；测试在目标服务器环境中连续通过后再提交。
 
-**Phase 1 追加验收点：** 第 1–5 项全部通过，且测试证明“PG attention 已逐层命中、R2 不依赖 R1、restore 与梯度正确、真实 FSDP2 hook 生效”。此前的“6/6 CPU 测试通过”和 0.5B pipeline 记录仅保留为历史排查信息，不构成通过本追加验证的证据。
+**Phase 1.2 验收点：** 第 1–5 项全部通过，且测试证明“PG attention 已逐层命中、R2 不依赖 R1、restore 与梯度正确、真实 FSDP2 hook 生效”。此前的“6/6 CPU 测试通过”和 0.5B pipeline 记录仅保留为历史排查信息，不构成通过本追加验证的证据。
 
 **提交：** 仅提交 attention patch 安装入口、Phase 1 adapter 修复、上述测试和结果记录；不要提交 `self.model.training` 的 train-only workaround，不要修改 RLVR pipeline。提交信息建议：`test: verify ROLL PrefixGrouper attention integration`。
 
-#### Phase 1.1：结果清单（dev+test）
+#### Phase 1.2：结果清单（dev+test）
 
 ##### 0719-1134 追加实验记录（dev+test）
 
-该记录属于 Phase 1.1 的结果，不是独立 Phase；实验代号为 `roll/scripts/run_pg_experiments.py` 的 `--experiment` 参数。
+该记录属于 Phase 1.2 的结果，不是独立 Phase；实验代号为 `roll/scripts/run_pg_experiments.py` 的 `--experiment` 参数。
 
 | 要求 | 代码实验名 | CLI 参数 | 脚本函数 | 结果 |
 |------|-----------|---------|---------|------|
@@ -373,12 +375,12 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **参数透传：** 在 `install_prefix_grouper_attention_patch()` 的 `_wrapped_fn` 加全局计数器；Qwen2.5-0.5B 的 24 个 decoder layer 对一次 grouped forward 记录 24 次调用。该结果证明模型 forward 已将同一 PrefixGrouper 实例传到每层 self-attention。
 
-**单 batch 等价：** 去掉 `@torch.no_grad()`，在 `model.train()` 下比较 baseline 与 PG forward+restore。记录 loss 为 7.134/7.150，差 0.016（0.22%，在 BF16 `rtol=0.02` 内）；max grad norm diff 为 3.06，未通过 BF16 梯度容差。该梯度差异必须在本 Phase 的 completion 隔离与逐参数梯度验证中继续定位，不能单独作为 Phase 1.1 放行依据。
+**单 batch 等价：** 去掉 `@torch.no_grad()`，在 `model.train()` 下比较 baseline 与 PG forward+restore。记录 loss 为 7.134/7.150，差 0.016（0.22%，在 BF16 `rtol=0.02` 内）；max grad norm diff 为 3.06，未通过 BF16 梯度容差。该梯度差异必须在本 Phase 的 completion 隔离与逐参数梯度验证中继续定位，不能单独作为 Phase 1.2 放行依据。
 
 - **状态：** 进行中，尚未通过。
 - **已有产物：** `roll/utils/prefix_grouper.py` 与 `tests/test_prefix_grouper_adapter.py`；仅 group build 的 6 个 CPU 用例记录为通过。
-- **尚缺结果：** patch 的实际逐层命中、completion 隔离、逐 token restore/gradient、真实 FSDP2 infer/train hook；必须按本 Phase 的追加验证逐项填写命令、spy 计数、误差表和 commit。
-- **放行条件：** 仅当本节追加验证的第 1–5 项全部通过时，才将状态改为“通过”并进入 Phase 2；此前的 pipeline/KL 数据不得填为通过证据。
+- **尚缺结果：** patch 的实际逐层命中、completion 隔离、逐 token restore/gradient、真实 FSDP2 infer/train hook；必须按 Phase 1.2 要求逐项填写命令、spy 计数、误差表和 commit。
+- **放行条件：** 仅当 Phase 1.2 的第 1–5 项全部通过时，才将状态改为“通过”并进入 Phase 2；此前的 pipeline/KL 数据不得填为通过证据。
 
 ### Phase 2：接入 ROLL 的 DP=1 数据顺序与 FSDP2 前向
 
