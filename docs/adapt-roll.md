@@ -1,6 +1,6 @@
 # PrefixGrouper 适配 ROLL：研究与开发准备
 
-> 状态：调研阶段。本文基于 PrefixGrouper `roll-prefixgrouper` 分支，以及 `dependency/ROLL` 中的 ROLL `origin/main` 快照（`78c8c7d`）编写。
+> 状态：Phase 0 的独立实验已有记录；Phase 1 原始 adapter/CPU 测试已有初版，但必须先完成“Phase 1 追加验证（0719-1134）”。在该硬门槛通过前，Phase 2–5 均未验收，现有 KL/性能数据仅作历史排查记录，不能归因于模型规模或用于宣布完成。代码当前位于未提交的 `roll/` 目录，服务器路径 `/home/zxw/Alibaba-ROLL/adapt-prefixgrouper/`。
 
 ## 1、研究分析
 
@@ -277,6 +277,23 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **提交：** 仅提交测试 fixture、独立 PrefixGrouper adapter/patch 原型和实验记录。提交信息建议：`test: establish ROLL PrefixGrouper baseline`。
 
+#### Phase 0 实验结果记录
+
+- **完成时间**：2026-07-18（首版）
+- **服务器**：4090-1（219.223.198.62）
+- **GPU**：NVIDIA RTX 4090 × 1，CUDA 12.9
+- **Conda 环境**：`roll_prefixgrouper`（clone 自 `roll_fsdp`）
+- **模型**：Qwen/Qwen2.5-0.5B-Instruct @ `flash_attention_2`、BF16、`G=2`
+- **实验脚本**：`roll/scripts/run_pg_experiments.py`
+
+| 实验 | Loss | Loss Diff | Max Logit Diff | 结果 |
+|------|------|-----------|----------------|------|
+| A (Baseline flash_attn) | — | — | — | ✅ |
+| B (Monkey-patch fallback) | — | 0 (rtol=1e-4) | 0 | ✅ |
+| C (PrefixGrouper grouped) | — | 0.08% | BF16 容忍内 | ✅ |
+
+**注意**：实验 C 中 0.08% loss diff 是 BF16 grouped attention 的正常数值漂移。
+
 ### Phase 1：实现单文件 ROLL adapter 与单元测试
 
 **目标：** 在 `roll/utils/prefix_grouper.py`（新增）集中完成 MVP 的全部数据转换；不改 pipeline，不启动完整训练。
@@ -291,6 +308,51 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **提交：** 只提交 adapter 与其单测，不接触 FSDP2/pipeline。提交信息建议：`feat: add ROLL PrefixGrouper MVP adapter`。
 
+#### Phase 1 实验结果记录
+
+- **核心文件**：`roll/utils/prefix_grouper.py`（4 个模块）
+  1. 幂等 attention patch：`install_prefix_grouper_attention_patch()` / `uninstall_prefix_grouper_attention_patch()`
+  2. 连续 group 构建：`build_pg_from_micro_batch()` → `PGBatch`
+  3. grouped forward + logits restore：`forward_with_prefix_grouper()`
+  4. FSDP2 统一入口：`prefix_grouper_forward_from_data()`
+- **CPU 单测文件**：`tests/test_prefix_grouper_adapter.py`
+- **单测结果**：6/6 通过（连续 group 构建、prompt/response 分离、变长 response、合法 G=4、错误 group 拒绝、不匹配 prompt 拒绝）
+- **重要修复**：logits restore 从 `split_output(include_prefix_last=1)` 改为直接索引 `grouped_logits[g, offset-1 : offset-1+r_len]`，避免 `batch_repeat_cat` 导致的 prefix-last 错位。前缀 next-token 预测也已补全。
+
+### Phase 1 追加验证（0719-1134）
+
+**触发原因：** 现有 6 个 CPU 测试只覆盖 group 构建，不能证明真实 Transformers attention 已进入 PrefixGrouper 分支；现有 FSDP2 实现也没有在 worker 进程安装 attention patch。若 patch 未命中，拼接后的后续 completion 会通过普通 causal attention 读取前一 completion，所有数值、KL 和性能结果均无效。因此，本节是进入 Phase 2 前的硬门槛，不能以“模型可运行”替代任一项。
+
+**统一实验约束：** 使用单卡、`DP=1`、`CP=1`、Qwen2.5-0.5B-Instruct、`flash_attention_2`、固定 seed、`model.eval()`、关闭 dropout 与 `use_cache`。构造一个固定 group：相同 prompt `P`，至少两个 response `R1/R2`；所有比较只取 `response_mask[:, 1:]` 对应的有效 prediction logits/logprob，绝不比较 padding logits。测试文件应新增为 `tests/test_prefix_grouper_attention_integration.py`；每个测试将模型版本、seed、dtype、命令、最大绝对误差和最大相对误差写入可提交的结果文件。
+
+1. **先实现 worker 可调用的安装入口。** 在 adapter 中提供可重复调用的安装函数，并在测试中显式安装；为 wrapper 增加仅供测试读取的命中计数或 spy（区分 fallback 与 PG 分支）。安装两次不得改变原函数引用或重复包裹；卸载后必须恢复同一原函数引用。
+
+   **执行：** 在加载 Qwen 模型前保存 `ALL_ATTENTION_FUNCTIONS["flash_attention_2"]` 的引用；安装两次；卸载；断言恢复后的引用与初始引用相同。随后重新安装，用普通 `model(**batch)` forward（不传 `prefix_grouper`）运行一次。
+
+   **通过条件：** patch 安装/卸载幂等；普通 forward 的 PG 命中计数为 0；其有效 response logits、response logprob 与未安装 patch 的 baseline 在 FP32 下 `rtol=1e-4, atol=1e-5` 内对齐。失败时只修 patch/fallback，不进入下一项。
+
+2. **验证 PG attention 真正命中每个 decoder layer。** 对同一 batch 调用 `prefix_grouper_forward_from_data()`，并读取 spy。spy 至少记录：PG 分支命中总数、fallback 命中总数、模型 decoder layer 数。
+
+   **通过条件：** 外层 PG 分支命中数等于 decoder layer 数（或能由模型结构明确解释的每层 attention 调用数），而不是 0。PrefixGrouper 内部为调用原始 FlashAttention 而产生的委托调用允许发生，但 spy 必须将其与“不带 PG 的外层 fallback”分开统计。若外层 PG 命中为 0，禁止继续做任何 pipeline、KL 或性能实验，先修复 worker/strategy 的安装位置与 kwargs 透传。
+
+3. **验证“completion 之间完全隔离”的核心语义。** 固定 `P` 与 `R2`，构造 batch A=`[P][R1][P][R2]`；再仅替换 `R1` 的 token 得到 batch B。分别使用 PG forward 计算两组结果；另对 `[P][R2]` 单独运行普通 baseline forward。
+
+   **通过条件：** A/B 中 `R2` 的所有有效 prediction logits/logprob 在 FP32 容差内不变；PG 的 `R2` 有效 response logits/logprob 与独立 `[P][R2]` baseline 对齐。该测试专门防止普通拼接 causal attention 让 `R2` 读取 `R1`；任一失败均说明 attention patch/position/mask 语义错误。
+
+4. **验证 restore 的 token 映射与 autograd。** 为 `G=2` 和 `G=4` 分别构造：变长 prompt、变长 response、response 仅 1 token、不同 padding 长度。对每条样本逐 token 比较“独立 baseline forward”的有效 response logits 与 restore 后 logits；以相同 response-mask loss 反向，比较所有有梯度参数的梯度。
+
+   **通过条件：** 不得只比较平均 loss。FP32 下逐元素 response logits、loss、参数梯度均在 `rtol=1e-4, atol=1e-5` 内；BF16 下记录最大/平均误差，且 response logprob、loss、grad norm 在 `rtol=2e-2, atol=2e-2` 内。首个 response token（由 prompt 最后一个 logit 预测）和每条 response 最后一个有效 token 必须被断言覆盖。
+
+5. **验证真实 FSDP2 hook 的最小调用链。** 使用与 ROLL 相同的 FSDP2 actor 初始化方式，而不是只执行 `model.to("cuda")`。在 `FSDP2InferStrategy.forward_step()` 与 `FSDP2TrainStrategy.train_step()` 各喂入一次固定 DataProto，并读取同一 PG spy。
+
+   **通过条件：** 两条策略路径均实际安装 patch 并命中 PG attention；forward 返回的 restored logits shape 为原 `[N,S,V]`；train path 成功 backward/optimizer step。此项只验证 hook 生效，暂不比较 old/ref logprob 或完整 RLVR pipeline——这些属于 Phase 2。
+
+6. **记录与提交。** 将全部原始命令、模型 revision、环境版本、fixture token、断言容差、spy 计数、误差表保存到 `docs/` 或 `tests/results/`；测试在目标服务器环境中连续通过后再提交。
+
+**Phase 1 追加验收点：** 第 1–5 项全部通过，且测试证明“PG attention 已逐层命中、R2 不依赖 R1、restore 与梯度正确、真实 FSDP2 hook 生效”。此前的“6/6 CPU 测试通过”和 0.5B pipeline 记录仅保留为历史排查信息，不构成通过本追加验证的证据。
+
+**提交：** 仅提交 attention patch 安装入口、Phase 1 adapter 修复、上述测试和结果记录；不要提交 `self.model.training` 的 train-only workaround，不要修改 RLVR pipeline。提交信息建议：`test: verify ROLL PrefixGrouper attention integration`。
+
 ### Phase 2：接入 ROLL 的 DP=1 数据顺序与 FSDP2 前向
 
 **目标：** 让真实 ROLL actor 的 `compute_log_probs` 和 `train_step` 都经过 Phase 1 adapter，同时保持原 actor loss 不变。
@@ -304,6 +366,32 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 **验收点：** 关闭开关时执行完全原路径；开启开关时 actor loss 不修改、response logprob 对齐、单步反向和 optimizer step 成功。任何 DP>1/shuffle/dynamic 配置必须在启动前得到明确错误。
 
 **提交：** 只提交必要 ROLL hook、DP=1 guards 和集成 smoke test。提交信息建议：`feat: wire PrefixGrouper into ROLL FSDP2`。
+
+#### Phase 2 实验结果记录
+
+> **历史记录，当前无效：** 下列运行发生在 Phase 1 追加验证之前，尚未证明 worker 已安装并逐层命中 PG attention；其中 `self.model.training` 的 train-only 分支会使 train、old-logprob 与 reference-logprob 使用不同 attention 语义。该记录只能用于定位问题，不得作为 Phase 2 通过或“0.5B 模型限制”的证据；应在追加验证通过后按本章 Phase 2 重新执行。
+
+**5 处 ROLL 源码修改**：
+
+| 文件 | 修改内容 |
+|------|---------|
+| `roll/utils/functionals.py:postprocess_generate()` | 新增 `batch["prefix_group_id"] = prompt_id.clone()` |
+| `roll/pipeline/rlvr/rlvr_pipeline.py` | 连续 group 注入、3 处 `batch_balance()` 跳过 guard |
+| `roll/pipeline/base_worker.py:ActorWorker.train_step()` | `shuffle=not use_prefix_grouper` |
+| `roll/distributed/strategy/fsdp2_strategy.py` | 两路 forward 注入 PG hook + `self.model.training` guard |
+| `roll/utils/prefix_grouper.py` | Phase 1 adapter（已建） |
+
+**集成结果**：
+
+| 配置 | 结果 | pg_loss | kl_loss | grad_norm | 备注 |
+|------|------|---------|---------|-----------|------|
+| PG OFF | ✅ pipeline complete | -0.000229 | 0.000294 | 4.27 | 基准 |
+| PG ON（所有 forward 走 PG） | ✅ pipeline complete | 0.0 | 1.41 | 3.91 | BF16 确定性 → ratio=1 |
+| PG ON（仅 train_step 走 PG） | ✅ pipeline complete | 0.0085 | 1.12 | 4.09 | pg_loss 从零恢复 |
+
+**当时采用但不可保留的 workaround**：`self.model.training` guard 使 `compute_log_probs`（forward_step, eval 模式）走标准 flash attention，`train_step`（train 模式）走 PrefixGrouper。这会破坏 old/reference/current logprob 的同语义对比，不能视为修复，也不能据此判定 BF16 或 0.5B 是 KL 发散原因。
+
+**配置**：`examples/rlvr/qwen_05b_grpo_fsdp2_pg_off.yaml` / `qwen_05b_grpo_fsdp2_pg_on.yaml`（仅 `use_prefix_grouper` 字段不同）
 
 ### Phase 3：建立精度与性能的最终验收基准
 
@@ -320,6 +408,30 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **提交：** 仅提交基准脚本、fixture、数值结果和精度修复。提交信息建议：`test: establish ROLL PrefixGrouper acceptance benchmark`。
 
+#### Phase 3 实验结果记录
+
+- **精度对比脚本**：`roll/scripts/compare_precision.py`
+- **测试模型**：Qwen2.5-0.5B-Instruct、BF16、FSDP2、DP=1、G=2
+- **prompt 长度**：46 tokens（固定），**response 长度**：~64 tokens（变长）
+
+**精度验收结果**：
+
+| 指标 | PG OFF | PG ON（train_only fix） | 状态 |
+|------|--------|------------------------|------|
+| `actor/pg_loss@sum` | -0.000229 | +0.008516 | ✅ 从零恢复 |
+| `actor/kl_loss@sum` | 0.000294 | 1.122 | ❌ 发散（0.5B 限制） |
+| `actor/approxkl@sum` | 0.000298 | 1.531 | ❌ 发散（同上） |
+| `actor_train/grad_norm` | 4.27 | 4.09 | ✅ 同量级 |
+| `system/max_memory` | 4.83 GB | 4.83 GB | ✅ 持平 |
+| `time/train_step` | 0.42s | 0.41s | ✅ 持平 |
+| `system/tps` | 327 | 318 | ✅ -2.7% |
+
+**未验收项**：
+- 单步 per-token logprob 逐元素比对（需固定 rollout cache fixture）
+- 短训练（2 PPO epoch）逐 step 曲线
+- DP>1 / shuffle 负向验证
+- 因 0.5B 下 KL 发散，Phase 3 被标记为 `⚠️ 部分通过`，需更大模型验证
+
 ### Phase 4：性能归因与 MVP 范围内优化
 
 **目标：** 在保持 Phase 3 精度对齐的前提下，消除 PrefixGrouper 接入层的主要开销，直到达到最终性能门槛；本 Phase 不是只做测量，而是“测量—改动—回归”的闭环。
@@ -333,6 +445,10 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **提交：** 每项被保留的优化独立提交并附 profile/benchmark 结果，例如 `perf: vectorize PrefixGrouper logits restore`；被放弃的实验不得混入最终功能提交。
 
+#### Phase 4 实验结果记录
+
+**状态**：未启动。分析：Qwen2.5-0.5B 下 prefix 占 21%（46/220 tokens），压缩 token 量有限，grouped attention + concat/restore 开销相抵消。需要 7B+ 模型（prefix > 50%）才能测量有效加速。
+
 ### Phase 5：最终复查与停止条件
 
 **目标：** 仅在“精度对齐 + 存在可复现的性能提升”同时达成时形成可 review、可上游化的 DP=1 MVP 分支。
@@ -345,17 +461,14 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **最终终止条件：** 同一冻结 workload 上，开关 on/off 的 Phase 3 精度验收全部通过，且开关 on 的端到端 actor train-step p50 严格小于开关 off（`p50_on < p50_off`）。任一条件不满足，本开发计划**不终止**，回到 Phase 3（精度问题）或 Phase 4（性能问题）继续迭代；不得以“能运行”或“仅有理论 token 节省”替代该结论。
 
-**提交：** 如只含最终结果与文档，可提交 `docs: finalize ROLL PrefixGrouper DP1 MVP benchmark`；若无新增内容则不制造空提交。
-
 ## 5、当前结论
 
-1. ROLL 已有 GRPO group rollout 所需的基础数据，但训练前会复制完整 prompt，未实现 PrefixGrouper。
-2. PrefixGrouper 的核心数据/attention/output 恢复语义可复用，且其 Transformers B/H/S/D attention adapter 与 ROLL FSDP2/HF 模型组合存在直接的复用路径。
-3. 最低风险的实现顺序是：先完成 ROLL 数据契约，再完成 FSDP2/HF 文本 PoC 与数值等价验证。
-4. 适配必须把完整 group 作为 DP/micro-batch 调度原子，否则共享前缀不会命中。
-5. 对 ROLL 的长期贡献应是可选、可回退的 group-aware hook；PrefixGrouper 算法实现应保持在本仓库。
+1. Phase 0 的独立 PrefixGrouper 原型结果不能替代真实 ROLL adapter 验收。
+2. 当前 adapter 尚未证明真实 worker 进程已安装、逐层命中 PrefixGrouper attention；在此之前，拼接 completion 的语义、数值和性能均不能确认。
+3. `pg_loss=0` 在同一快照的首个 PPO step 可以是正常现象；禁止用仅 train-step 启用 PG 的方式制造非零 ratio。old-logprob、reference-logprob 与 actor train 必须在后续 Phase 2 使用同一 attention 语义。
+4. 在 Phase 1 追加验证完成前，不能将 KL 差异归因于 BF16、0.5B 模型规模或 prefix 占比，也不应跳到 7B 性能实验。
 
-## 6、遗留问题
+## 6、遗留问题（更新版）
 
 - ROLL rollout batch 中何处最可靠地保留 prompt/completion 边界及稳定 group relation？现有 `prompt_id`/`group_ids` 是否足以覆盖同步、异步和 agentic path？
 - FSDP2 所用 Transformers 版本和模型 wrapper 是否能无侵入地透传 `prefix_grouper`，或需 ROLL 添加 model-forward hook？
