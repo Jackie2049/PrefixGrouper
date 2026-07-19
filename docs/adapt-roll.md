@@ -1,6 +1,6 @@
 # PrefixGrouper 适配 ROLL：研究与开发准备
 
-> 状态：Phase 0~2 开发完成且在服务器可复现。Phase 1 追加实验（0719-1134）确认 attention kwargs 透传和单 batch 数值等价。Phase 2 管线贯通（PG ON/OFF 均 pipeline complete!），pg_loss=0 已修复。Phase 3 精度对齐有固有差异（suffix attention 路径不同），Phase 4~5 未启动。
+> 状态：Phase 1.2 测试进行中。P1.2-A（patch 生命周期）和 P1.2-B（逐层透传）已通过。P1.2-C 是关键阻断项，fixture 已修复但必须按 C.1–C.3 补齐张量布局、逐层隔离和输出等价证据；P1.2-D/E 因而阻塞，P1.2-F 待运行。此前将失败归因为 `suffix_attn_mask` 的结论已作废。
 
 ## 1、研究分析
 
@@ -341,9 +341,27 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
    **命令：** `pytest -q tests/test_prefix_grouper_attention_integration.py -k p12_b`。**断言：** `pg_outer_calls == num_decoder_layers`；外层 plain fallback 为 0；PrefixGrouper 为调用原 FlashAttention 产生的内部 delegate 单独计数且允许存在。失败停止，先修 kwargs/patch 安装。
 
-3. **P1.2-C：`test_p12_c_completion_isolation`（completion 隔离）。** 构造 A=`[P,R1,R2]` 与 B=`[P,R1',R2]`，只改变 `R1` token；分别跑 PG forward。另对单条 `[P,R2]` 跑普通 baseline forward。
+3. **P1.2-C：`test_p12_c_completion_isolation`（completion 隔离与 attention 契约）。** 这是进入 D–F 前的关键硬门槛。它既验证“改变 R1 不影响 R2”，也验证该结论所依赖的 PrefixGrouper K/V 重组、张量布局与 FlashAttention 调用契约；不可只比较最终 logits 后直接猜测根因。
 
-   **命令：** `pytest -q tests/test_prefix_grouper_attention_integration.py -k p12_c`。**断言：** A/B 中 `R2` 的每个有效 response logit 与 logprob 在 BF16 `rtol=2e-2, atol=2e-2` 内；PG 的 `R2` 与独立 baseline 同容差对齐。失败表明 suffix 串扰或 position/mask 错误，禁止进入 D–F。
+   **固定 fixture 与调用纪律。** 构造 A=`[P,R1,R2]` 与 B=`[P,R1',R2]`，`P`、`R2`、长度、padding、position IDs 完全相同，唯一可变输入是 `R1` token；`R2` 必须在 `make_group()` 外只生成一次，并作为参数传入 A/B。另构造独立普通 baseline `[P,R2]`。每次 PG forward 都用 `try/finally` 保证卸载 attention patch；任何断言失败都不得污染之后的 D/E。
+
+   **C.1：布局与 K/V 重组断言（先运行，不依赖模型数值）。** 针对 `group_info=[[len(P), len(R1), len(R2)]]`，直接调用 `PrefixGrouper.ungroup()` 并断言：
+
+   - 进入 PrefixGrouper core 的 Q/K/V 是 **BHSD** `[B,H,S,D]`；`S == len(P)+len(R1)+len(R2)`。本 MVP 使用 padded dense batch：模型输入是 `[B,S]`，core 是 BHSD；不使用 BSHD 作为 core 接口，也不使用 packed THD / `cu_seqlens`。
+   - `k_prefix[0]` / `v_prefix[0]` 恰为 grouped 的 `P` slice；`k_suffix[0]` / `v_suffix[0]` 恰为 `R1`，`k_suffix[1]` / `v_suffix[1]` 恰为 `R2`（忽略各自 right padding）。
+   - `batch_repeat_cat(k_prefix, k_suffix, cat_dim=2)[1]` 与 `concat(P,R2)` 逐元素相等；同样验证 V。显式断言其中没有任何 `R1` slice。`suffix_attn_mask[1]` 的有效区恰为 `P + R2`，shape 为 `[num_samples, max_prefix_len + max_suffix_len]`，不得把它误写为 `G×prefix_len`。
+
+   **C.2：逐层隔离与 attention 调用记录。** 在 patch 的 PG 外层为每一 decoder layer 记录（仅测试模式，不进入生产热路径）：layer index、Q/K/V 原始 shape、`q_suffix[1]`、`k_suffix[1]`、拼接后 `K/V[1]` 的 hash 或 `torch.equal` 结果、`suffix_attn_mask[1]`、`is_causal`、`use_top_left_mask`。分别运行 A/B，定位 R2 在哪一层第一次不同：
+
+   - 第 0 层的 R2 输入 Q/K/V 或拼接 K/V 已不同：修 batch builder、BHSD adapter 或 ungroup index；
+   - 第 0 层输入相同而 attention 输出不同：检查 FlashAttention 参数及 `q_len < k_len` 的 causal 对齐；
+   - 某个后续层首次不同：检查前一层 `GroupFunction` 回填、attention output layout、residual 路径或 position IDs。
+
+   不允许将“最终 logits 不同”直接归因为 `suffix_attn_mask`；只有 C.1 的 K/V 断言失败，或 C.2 的 layer-level 证据，才能指定修复点。
+
+   **C.3：输出等价。** 在 C.1/C.2 全通过后，比较 A/B 中 R2 的每个有效 response logit 与 logprob；再将 PG 的 R2 与独立 `[P,R2]` 普通 baseline 比较。每个比较分别报告 `max_abs`、`max_rel`、首个超容差的 `(response_position, vocab_index)`、该元素 A/B/base 值；不得只报告某个 logit 值或平均 loss。
+
+   **命令：** `pytest -q -s tests/test_prefix_grouper_attention_integration.py -k p12_c`。**断言：** C.1 的全部精确张量断言通过；C.2 显示 R2 不在任一层产生 A/B 差异；C.3 的 A/B 与 PG/baseline 有效 response logits、logprob 均在 BF16 `rtol=2e-2, atol=2e-2` 内。任一项失败即 P1.2-C 失败，并按上述首个差异层定位；禁止进入 D–F，禁止先改 PrefixGrouper core 的 2D padding mask 为 4D mask。
 
 4. **P1.2-D：`test_p12_d_restore_token_mapping`（逐 token restore）。** 参数化两组 fixture：`G=2` 与 `G=4`；每组同时包含变长 prompt、变长 response、恰好 1 token response 和不同右 padding。逐条样本执行独立 baseline forward 与 grouped+restore forward。
 
@@ -363,25 +381,22 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 #### Phase 1.2：结果清单（dev+test）
 
-##### 0719-1134 历史实验记录（dev+test，不能替代 P1.2-A–F）
+测试文件：`tests/test_prefix_grouper_attention_integration.py`
+运行环境：单卡 RTX 4090, Qwen2.5-0.5B-Instruct, flash_attention_2, BF16, seed=42, `model.eval()`
 
-该记录属于 Phase 1.2 的结果，不是独立 Phase；实验代号为 `roll/scripts/run_pg_experiments.py` 的 `--experiment` 参数。
+> **P1.2-C 夹具修复（0719-1542）**：初始版本中 A/B 两次 `make_group()` 内 R2 都重新 `torch.randint`，导致比较的不是同一个 R2。现已修复为在函数外生成一次 R2 并传入 A/B。
+> **旧失败结论无效，需按新的 C.1–C.3 重新执行。** “首 token 的两个 logit 值不同”既未报告超容差坐标，也不能证明 R2 的 K/V 包含 R1；当前实现按 BHSD 在 batch 维分离 completion，`suffix_attn_mask` 是 FlashAttention 的 2D padding mask，而不是跨 completion 的 4D mask。
 
-| 对应新实验 | 旧实验名 | CLI 参数 | 旧结论 | 新判定 |
-|------------|---------|---------|--------|---------|
-| P1.2-A | 实验 B | `monkey_patch` | fallback 数值一致 | ⚠️ 缺生命周期引用断言 |
-| P1.2-B | 实验 D | `pg_count` | 24 layer 调用 | ⚠️ 缺三类 spy 计数 |
-| P1.2-E | 实验 E | `train_equivalence` | loss 对齐、grad 不齐 | ❌ 使用 `model.train()`，且只比 grad norm |
-| P1.2-C/D/F | — | — | 无记录 | ❌ 未执行 |
+| 测试 | 结果 | 说明 |
+|------|------|------|
+| **P1.2-A** patch 生命周期与 fallback | ✅ PASSED | 安装/卸载/重装 idempotent；baseline 与 patched+`prefix_grouper=None` 的 response logits `torch.equal`；`plain_fallback_calls=24=num_layers`；`pg_outer_calls=0` |
+| **P1.2-B** 逐层参数透传 | ✅ PASSED | `pg_outer_calls=24=num_layers`；`plain_fallback_calls=0`；`delegate_calls>0` |
+| **P1.2-C** completion 隔离 | ⏳ 待按 C.1–C.3 重测 | fixture 已修复；此前“2D mask 导致 R2 读取 R1”的归因未被张量证据支持，旧失败结论作废 |
+| **P1.2-D** 逐 token restore | ⏸️ 阻塞 | 依赖 P1.2-C 通过；此前失败的根因尚未确定 |
+| **P1.2-E** 逐参数梯度 | ⏸️ 阻塞 | 依赖 P1.2-C/D 通过；此前梯度差异的根因尚未确定 |
+| **P1.2-F** FSDP2 hook | ⏳ 未运行 | 待脚本改造 |
 
-**参数透传：** 在 `install_prefix_grouper_attention_patch()` 的 `_wrapped_fn` 加全局计数器；Qwen2.5-0.5B 的 24 个 decoder layer 对一次 grouped forward 记录 24 次调用。这是 B 的积极证据，但仍须补齐 outer/fallback/delegate 三类计数。
-
-**单 batch 等价：** 旧实验去掉 `@torch.no_grad()` 后却使用 `model.train()`，记录 loss 为 7.134/7.150、max grad norm diff 为 3.06。该实验不符合 P1.2-E 的 eval-mode 与逐参数 tensor 比较口径，必须重写，不能把梯度差异宣称为固有差异或作为 Phase 1.2 放行依据。
-
-- **状态：** 进行中，尚未通过。
-- **已有产物：** `roll/utils/prefix_grouper.py` 与 `tests/test_prefix_grouper_adapter.py`；仅 group build 的 6 个 CPU 用例记录为通过。
-- **尚缺结果：** patch 的实际逐层命中、completion 隔离、逐 token restore/gradient、真实 FSDP2 infer/train hook；必须按 Phase 1.2 要求逐项填写命令、spy 计数、误差表和 commit。
-- **放行条件：** 仅当 Phase 1.2 的第 1–5 项全部通过时，才将状态改为“通过”并进入 Phase 2；此前的 pipeline/KL 数据不得填为通过证据。
+**当前状态**：P1.2-A/B 通过；P1.2-C 是关键阻断项，必须先完成 C.1–C.3 的张量级证据与数值等价；D/E 因而阻塞，F 尚未运行。当前没有证据支持修改 `GroupInfo.precompute()` 的 `suffix_attn_mask`，更不得在未验证 FlashAttention causal 参数前引入 4D mask。
 
 ### Phase 2：接入 ROLL 的 DP=1 数据顺序与 FSDP2 前向
 
@@ -401,7 +416,7 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 #### Phase 2.1：结果清单（dev+test）
 
-> **历史记录，当前无效：** 下列运行发生在 Phase 1 追加验证之前，尚未证明 worker 已安装并逐层命中 PG attention；其中 `self.model.training` 的 train-only 分支会使 train、old-logprob 与 reference-logprob 使用不同 attention 语义。该记录只能用于定位问题，不得作为 Phase 2 通过或“0.5B 模型限制”的证据；应在追加验证通过后按本章 Phase 2 重新执行。
+> **历史记录，当前无效：** 下列运行发生在 Phase 1.2 P1.2-C/D/E 尚未通过前，尚未完成 completion 隔离的张量级验证与数值对齐，所有 pipeline 数据的数值基础无效。该记录只能用于定位问题，不得作为 Phase 2 通过证据。Phase 1.2 通过后应按本章要求重新执行。
 
 **5 处 ROLL 源码修改**：
 
