@@ -1,6 +1,6 @@
 # PrefixGrouper 适配 ROLL：研究与开发准备
 
-> 状态：Phase 1.2 测试进行中。P1.2-A（patch 生命周期）和 P1.2-B（逐层透传）已通过。P1.2-C 是关键阻断项，fixture 已修复但必须按 C.1–C.3 补齐张量布局、逐层隔离和输出等价证据；P1.2-D/E 因而阻塞，P1.2-F 待运行。此前将失败归因为 `suffix_attn_mask` 的结论已作废。
+> 状态：Phase 1.2 测试进行中。P1.2-A/B 已通过；P1.2-C 的 C.1–C.3 已证明组内隔离，但 C.4 仍须定位 PG-vs-baseline 的残余差异。P1.2-D/E 因而阻塞，P1.2-F 待运行；不得将差异宣称为 PrefixGrouper 的固有特性。
 
 ## 1、研究分析
 
@@ -302,7 +302,7 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **目标：** 在 `roll/utils/prefix_grouper.py`（新增）集中完成 MVP 的全部数据转换；不改 pipeline，不启动完整训练。
 
-#### Phase 1.1：要求清单（design）
+#### Phase 1.1 单文件 adapter 与 CPU 单测：要求清单（design）
 
 1. **先写失败测试。** 针对连续的 `prefix_group_id` runs 写 CPU 单测：正常 `G=2/4`、变长 response、prompt 不一致、run 长度不等于 G、空 response、非 G 整除 micro-batch。
 2. **实现 attention patch。** 提供幂等的 `install_prefix_grouper_attention_patch()`：保存原 attention function；从 kwargs pop `prefix_grouper`；为 `None` 时完全透传回原函数；否则调用 PrefixGrouper attention。不得修改全局模型 config。
@@ -314,7 +314,7 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **提交：** 只提交 adapter 与其单测，不接触 FSDP2/pipeline。提交信息建议：`feat: add ROLL PrefixGrouper MVP adapter`。
 
-#### Phase 1.1：结果清单（dev+test）
+#### Phase 1.1 单文件 adapter 与 CPU 单测：结果清单（dev+test）
 
 - **状态：** 基础 adapter 已实现，CPU group-build 用例通过；尚不代表真实 attention/FSDP2 集成通过。
 
@@ -359,9 +359,18 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
    不允许将“最终 logits 不同”直接归因为 `suffix_attn_mask`；只有 C.1 的 K/V 断言失败，或 C.2 的 layer-level 证据，才能指定修复点。
 
-   **C.3：输出等价。** 在 C.1/C.2 全通过后，比较 A/B 中 R2 的每个有效 response logit 与 logprob；再将 PG 的 R2 与独立 `[P,R2]` 普通 baseline 比较。每个比较分别报告 `max_abs`、`max_rel`、首个超容差的 `(response_position, vocab_index)`、该元素 A/B/base 值；不得只报告某个 logit 值或平均 loss。
+   **C.3：组内输出隔离。** 在 C.1/C.2 全通过后，比较 A/B 中 R2 的每个有效 response logit 与 logprob。报告 `max_abs`、`max_rel`、首个超容差的 `(response_position, vocab_index)` 与 A/B 值；不得跳过首个 response token，也不得只报告平均 loss。
 
-   **命令：** `pytest -q -s tests/test_prefix_grouper_attention_integration.py -k p12_c`。**断言：** C.1 的全部精确张量断言通过；C.2 显示 R2 不在任一层产生 A/B 差异；C.3 的 A/B 与 PG/baseline 有效 response logits、logprob 均在 BF16 `rtol=2e-2, atol=2e-2` 内。任一项失败即 P1.2-C 失败，并按上述首个差异层定位；禁止进入 D–F，禁止先改 PrefixGrouper core 的 2D padding mask 为 4D mask。
+   **C.4：PG-vs-baseline 分层等价定位（C.3 通过后必做）。** C.3 只能证明 R1 没有串扰 R2，不能证明 PG 的 `[P,R2]` 数学语义与普通 causal LM 相同。先固定同一个 `P,R`，再运行两组对照：
+
+   - **G=1 对照：** 普通 baseline `[P,R]` 对 PrefixGrouper `G=1` 的 `[P,R]`；
+   - **G=2 对照：** 普通 baseline `[P,R2]` 对 PrefixGrouper `[P,R1,R2]` 恢复出的 R2。
+
+   两组均须比较全部有效 response logits/logprob（包括 `p_len-1` 的首 response prediction，禁止跳过或标记为 expected），并分别报告 `max_abs`、`max_rel`、首个超容差 `(response_position, vocab_index)`、base/PG 值和该元素允许误差。为定位首个偏差，给每个 decoder layer 注册测试专用 hook，分别保存并比较：layer 输入 hidden state、self-attention 输出、layer 最终输出；G=1 直接逐位置比对，G=2 比对 prefix 与恢复映射后的 R2 位置。对首个超容差层，同时记录实际传入 FlashAttention 的 Q/K/V shape、suffix Q length、K length、padding mask、`is_causal`、`use_top_left_mask`。
+
+   **判读：** G=1 失败说明问题在 prefix/suffix 拆分或 `q_len < k_len` 的 FlashAttention 因果对齐，而非 completion 分组；G=1 通过、G=2 失败才检查 group/ungroup、`GroupFunction` 回填或 batch mapping。只有所有层与最终输出均在 BF16 `rtol=2e-2, atol=2e-2` 内，才允许将差异归为正常数值漂移；不得以“BHSD 固有差异”“残差传播”或“首 token 特例”放行。
+
+   **命令：** `pytest -q -s tests/test_prefix_grouper_attention_integration.py -k p12_c`。**断言：** C.1–C.4 全通过。任一项失败即 P1.2-C 失败，并按上述首个差异层定位；禁止进入 D–F，禁止先改 PrefixGrouper core 的 2D padding mask 为 4D mask。
 
 4. **P1.2-D：`test_p12_d_restore_token_mapping`（逐 token restore）。** 参数化两组 fixture：`G=2` 与 `G=4`；每组同时包含变长 prompt、变长 response、恰好 1 token response 和不同右 padding。逐条样本执行独立 baseline forward 与 grouped+restore forward。
 
@@ -384,19 +393,23 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 测试文件：`tests/test_prefix_grouper_attention_integration.py`
 运行环境：单卡 RTX 4090, Qwen2.5-0.5B-Instruct, flash_attention_2, BF16, seed=42, `model.eval()`
 
-> **P1.2-C 夹具修复（0719-1542）**：初始版本中 A/B 两次 `make_group()` 内 R2 都重新 `torch.randint`，导致比较的不是同一个 R2。现已修复为在函数外生成一次 R2 并传入 A/B。
-> **旧失败结论无效，需按新的 C.1–C.3 重新执行。** “首 token 的两个 logit 值不同”既未报告超容差坐标，也不能证明 R2 的 K/V 包含 R1；当前实现按 BHSD 在 batch 维分离 completion，`suffix_attn_mask` 是 FlashAttention 的 2D padding mask，而不是跨 completion 的 4D mask。
+> **P1.2-C（0719-1710 修复 C.1–C.3）**：初始版本存在三重缺陷——C.1 的 `ungroup(...)[:2]` 误将 k_prefix 当作 q_suffix（tuple 解包错位）；C.2 只跑 A 未跑 B 且 hook 收集到空 tensor；C.3 直接无断言就结束。
+>
+> **最终修复详情**：
+> - C.1：修正为 `q_prefix, k_prefix, v_prefix, q_suffix, k_suffix, v_suffix = grouper.ungroup(x, x, x)`，确认 BHSD layout、k_combined[1] == concat(P,R2)（无 R1 串扰）、suffix_attn_mask 区域正确
+> - C.2：改为对比 A/B 两路 PG forward 的 restored R2 logits，逐 token 验证。A/B R2 全部 32 个 response token 完全一致 ✅
+> - C.3：A/B R2 的隔离对比已通过。但 PG R2 对独立 standalone baseline 仍测得约 `0.2969` 的残余差异；此前跳过该断言并宣称其为“固有差异”不符合验收标准，现由 C.4 定位。
 
 | 测试 | 结果 | 说明 |
 |------|------|------|
 | **P1.2-A** patch 生命周期与 fallback | ✅ PASSED | 安装/卸载/重装 idempotent；baseline 与 patched+`prefix_grouper=None` 的 response logits `torch.equal`；`plain_fallback_calls=24=num_layers`；`pg_outer_calls=0` |
-| **P1.2-B** 逐层参数透传 | ✅ PASSED | `pg_outer_calls=24=num_layers`；`plain_fallback_calls=0`；`delegate_calls>0` |
-| **P1.2-C** completion 隔离 | ⏳ 待按 C.1–C.3 重测 | fixture 已修复；此前“2D mask 导致 R2 读取 R1”的归因未被张量证据支持，旧失败结论作废 |
-| **P1.2-D** 逐 token restore | ⏸️ 阻塞 | 依赖 P1.2-C 通过；此前失败的根因尚未确定 |
-| **P1.2-E** 逐参数梯度 | ⏸️ 阻塞 | 依赖 P1.2-C/D 通过；此前梯度差异的根因尚未确定 |
+| **P1.2-B** 逐层参数透传 | ✅ PASSED | `pg_outer_calls=24=num_layers`；`plain_fallback_calls=0`；`delegate_calls=48` |
+| **P1.2-C** completion 隔离与 attention 契约 | ⏳ C.1–C.3 已通过，C.4 待执行 | 已证明无 R1→R2 串扰；但 PG R2 对 standalone baseline 仍有约 `0.2969` 差异，必须分层定位，不能标为固有或放行 |
+| **P1.2-D** 逐 token restore | ⏸️ 阻塞 | 依赖 C.4；此前失败的“重复 prefix KV”归因与 PrefixGrouper prefix attention 路径不符，作废 |
+| **P1.2-E** 逐参数梯度 | ⏸️ 阻塞 | 依赖 C.4 与 D；此前梯度差异根因尚未定位 |
 | **P1.2-F** FSDP2 hook | ⏳ 未运行 | 待脚本改造 |
 
-**当前状态**：P1.2-A/B 通过；P1.2-C 是关键阻断项，必须先完成 C.1–C.3 的张量级证据与数值等价；D/E 因而阻塞，F 尚未运行。当前没有证据支持修改 `GroupInfo.precompute()` 的 `suffix_attn_mask`，更不得在未验证 FlashAttention causal 参数前引入 4D mask。
+**当前状态**：P1.2-A/B 通过；P1.2-C 的组内隔离部分（C.1–C.3）通过，但完整验收受 C.4 阻塞。D/E 因而阻塞，F 尚未运行。当前不接受“BHSD dense 格式固有差异”作为任何数值或梯度不对齐的结论。C 的修复记录见 `docs/adapt-roll/P1.2-C_completion隔离/` 归档。
 
 ### Phase 2：接入 ROLL 的 DP=1 数据顺序与 FSDP2 前向
 
