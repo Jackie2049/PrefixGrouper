@@ -259,13 +259,17 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 ## 4、开发计划
 
-本章是交给后续开发 Agent 的执行顺序。每个 Phase 都遵循同一纪律：**先实验/阅读，再做最小代码改动，再运行该 Phase 的测试，达到验收点后只提交一个语义单一的 commit 并推送。** 验收失败时先修复或在 commit 说明中记录阻塞原因；不得跳过失败测试进入下一 Phase，也不得提前实现 DP>1、shuffle、动态 batching 或其他非 MVP 能力。
+本章是交给后续开发 Agent 的唯一执行清单。每个 Phase 均采用同一结构：三级标题说明 Phase 目标；四级标题 `Phase X.1：要求清单（design）` 定义本轮必须做的实验、开发、测试、验收和提交；四级标题 `Phase X.1：结果清单（dev+test）` 记录实际代码、命令、原始结果、是否通过及 commit。**初次只创建 X.1；只有 X.1 完成后仍发现独立、不可并入的新工作时，才新增 X.2。**
+
+共同纪律：先实验/阅读，再做最小改动，再运行本 Phase 测试；任一验收失败不得进入下一 Phase。每个通过的 Phase 只提交一个语义单一的 commit 并推送。当前仅做 FSDP2、文本模型、`DP=1` MVP；不得提前实现 DP>1、group-aware 调度、shuffle、动态 batching、LoRA 或多模态。
 
 `dependency/ROLL` 是固定在 `78c8c7d` 的参考快照；每次开发前先确认它没有被无意改动。若某个 MVP hook 必须改 ROLL 源码，应只修改计划列出的文件，并在同一 commit 中记录为将来向 ROLL 提交的最小 patch。
 
 ### Phase 0：环境确认与可复现基线（不接入 ROLL）
 
 **目标：** 证明目标 Transformers 模型、当前 PrefixGrouper 和 GPU 环境可以完成最基本的 shared-prefix forward；此阶段不改 ROLL 训练路径。
+
+#### Phase 0.1：要求清单（design）
 
 1. **检查。** 记录 PrefixGrouper、ROLL snapshot、PyTorch、Transformers、FlashAttention、CUDA 和 GPU 型号/显存；选择一个纯文本 causal LM、`flash_attention_2`、BF16、`G=2` 作为唯一首发组合。
 2. **实验 A：baseline attention。** 用固定随机种子、两组 prompt/response token 构造普通 `[P][R]` batch，保存 baseline response logprob、loss、参数梯度和 peak memory。
@@ -277,7 +281,7 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **提交：** 仅提交测试 fixture、独立 PrefixGrouper adapter/patch 原型和实验记录。提交信息建议：`test: establish ROLL PrefixGrouper baseline`。
 
-#### Phase 0 实验结果记录
+#### Phase 0.1：结果清单（dev+test）
 
 - **完成时间**：2026-07-18（首版）
 - **服务器**：4090-1（219.223.198.62）
@@ -298,6 +302,8 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **目标：** 在 `roll/utils/prefix_grouper.py`（新增）集中完成 MVP 的全部数据转换；不改 pipeline，不启动完整训练。
 
+#### Phase 1.1：要求清单（design）
+
 1. **先写失败测试。** 针对连续的 `prefix_group_id` runs 写 CPU 单测：正常 `G=2/4`、变长 response、prompt 不一致、run 长度不等于 G、空 response、非 G 整除 micro-batch。
 2. **实现 attention patch。** 提供幂等的 `install_prefix_grouper_attention_patch()`：保存原 attention function；从 kwargs pop `prefix_grouper`；为 `None` 时完全透传回原函数；否则调用 PrefixGrouper attention。不得修改全局模型 config。
 3. **实现 batch helper。** 实现 `build_pg_from_micro_batch(data, group_size, pad_id)`，返回 `PrefixGrouper`、grouped input IDs、padding mask、重置后的 2D position IDs、连续 run 映射。它只接受 ROLL 已有的 `input_ids/prompt_mask/response_mask/prefix_group_id`。
@@ -308,7 +314,7 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **提交：** 只提交 adapter 与其单测，不接触 FSDP2/pipeline。提交信息建议：`feat: add ROLL PrefixGrouper MVP adapter`。
 
-#### Phase 1 实验结果记录
+##### 既有开发记录（不构成验收结果）
 
 - **核心文件**：`roll/utils/prefix_grouper.py`（4 个模块）
   1. 幂等 attention patch：`install_prefix_grouper_attention_patch()` / `uninstall_prefix_grouper_attention_patch()`
@@ -319,7 +325,7 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 - **单测结果**：6/6 通过（连续 group 构建、prompt/response 分离、变长 response、合法 G=4、错误 group 拒绝、不匹配 prompt 拒绝）
 - **重要修复**：logits restore 从 `split_output(include_prefix_last=1)` 改为直接索引 `grouped_logits[g, offset-1 : offset-1+r_len]`，避免 `batch_repeat_cat` 导致的 prefix-last 错位。前缀 next-token 预测也已补全。
 
-### Phase 1 追加验证（0719-1134）
+##### 0719-1134 追加验证（Phase 1.1 必做）
 
 **触发原因：** 现有 6 个 CPU 测试只覆盖 group 构建，不能证明真实 Transformers attention 已进入 PrefixGrouper 分支；现有 FSDP2 实现也没有在 worker 进程安装 attention patch。若 patch 未命中，拼接后的后续 completion 会通过普通 causal attention 读取前一 completion，所有数值、KL 和性能结果均无效。因此，本节是进入 Phase 2 前的硬门槛，不能以“模型可运行”替代任一项。
 
@@ -353,21 +359,30 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **提交：** 仅提交 attention patch 安装入口、Phase 1 adapter 修复、上述测试和结果记录；不要提交 `self.model.training` 的 train-only workaround，不要修改 RLVR pipeline。提交信息建议：`test: verify ROLL PrefixGrouper attention integration`。
 
+#### Phase 1.1：结果清单（dev+test）
+
+- **状态：** 进行中，尚未通过。
+- **已有产物：** `roll/utils/prefix_grouper.py` 与 `tests/test_prefix_grouper_adapter.py`；仅 group build 的 6 个 CPU 用例记录为通过。
+- **尚缺结果：** patch 的实际逐层命中、completion 隔离、逐 token restore/gradient、真实 FSDP2 infer/train hook；必须按本 Phase 的追加验证逐项填写命令、spy 计数、误差表和 commit。
+- **放行条件：** 仅当本节追加验证的第 1–5 项全部通过时，才将状态改为“通过”并进入 Phase 2；此前的 pipeline/KL 数据不得填为通过证据。
+
 ### Phase 2：接入 ROLL 的 DP=1 数据顺序与 FSDP2 前向
 
 **目标：** 让真实 ROLL actor 的 `compute_log_probs` 和 `train_step` 都经过 Phase 1 adapter，同时保持原 actor loss 不变。
 
+#### Phase 2.1：要求清单（design）
+
 1. **保留 group ID。** 在 `postprocess_generate()` 将复制后的 prompt 标识写为 `prefix_group_id`；确认 RLVR pipeline 重设/删除 `prompt_id` 时不会删除它。
 2. **加 MVP fail-fast guards。** 启用时要求 `dp_size=1`、`cp_size=1`、无 dynamic batching/packing、无 LoRA/多模态；`infer_batch_size`、`per_device_train_batch_size` 和外层 backward batch size 都必须能被 G 整除。
 3. **保持连续顺序。** 在 actor train 路径跳过 `batch_balance()`；在 `ActorWorker.train_step()` 对 PrefixGrouper 启用时使用 `shuffle=False`。不要实现 group-aware sampler。
-4. **接入两个 FSDP2 路径。** 在 `FSDP2InferStrategy.forward_step()` 与 `FSDP2TrainStrategy.train_step()` 的现有 autocast/no-sync 范围内调用同一个 adapter。`forward_step` 的 `micro_batch_size` 与训练内层 `per_device_train_batch_size` 都要先做 `% G == 0` 校验。
+4. **接入三个 logprob 语义路径。** 在 actor train、actor old-logprob 与 reference-logprob 各自 worker 中安装同一 patch；`FSDP2InferStrategy.forward_step()` 与 `FSDP2TrainStrategy.train_step()` 均调用同一 adapter。不得以 `self.model.training` 让任一路径退回标准 attention；`forward_step` 的 `micro_batch_size` 与训练内层 `per_device_train_batch_size` 都要先做 `% G == 0` 校验。
 5. **最小烟雾测试。** 用固定 rollout fixture 跑一次 `compute_log_probs`，再跑一次 actor `train_step`；确认返回 tensor shape、metrics key、optimizer step 和梯度均正常。
 
 **验收点：** 关闭开关时执行完全原路径；开启开关时 actor loss 不修改、response logprob 对齐、单步反向和 optimizer step 成功。任何 DP>1/shuffle/dynamic 配置必须在启动前得到明确错误。
 
 **提交：** 只提交必要 ROLL hook、DP=1 guards 和集成 smoke test。提交信息建议：`feat: wire PrefixGrouper into ROLL FSDP2`。
 
-#### Phase 2 实验结果记录
+#### Phase 2.1：结果清单（dev+test）
 
 > **历史记录，当前无效：** 下列运行发生在 Phase 1 追加验证之前，尚未证明 worker 已安装并逐层命中 PG attention；其中 `self.model.training` 的 train-only 分支会使 train、old-logprob 与 reference-logprob 使用不同 attention 语义。该记录只能用于定位问题，不得作为 Phase 2 通过或“0.5B 模型限制”的证据；应在追加验证通过后按本章 Phase 2 重新执行。
 
@@ -397,6 +412,8 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **目标：** 固定一套不会被“挑选简单样本”影响的 off/on 对比基准，并先证明精度对齐。这套基准是后续优化与最终停止的唯一裁判；在它通过前，不得宣称特性完成。
 
+#### Phase 3.1：要求清单（design）
+
 1. **冻结代表性 workload。** 使用与真实 GRPO rollout 相同的 tokenizer、模型、BF16、FSDP2 配置和 `DP=1`，固定随机种子。至少包含 `G=4`，并选择共享 prompt token 占该 group 原始 token 总量不少于 50% 的 fixture；记录 prompt/response 长度分布、有效 token 数和 group 数。该 workload 只用于验收，不能在优化期间更换。
 2. **定义测量方法。** 先 warm-up 10 step，再各测 off/on 30 个完整 actor train step；每次都同步 CUDA 后计时，报告 p50、p90、均值、peak allocated memory。计时覆盖 ROLL actor 取 batch、PrefixGrouper transform/restore、forward、backward、optimizer step，但不包含 rollout 推理与网络 I/O。关闭时必须使用完全原始 ROLL 路径。
 3. **精度对齐：单步。** 对相同固定 rollout 比对 response token 的 logprob、entropy、KL、actor loss、grad norm、每个 parameter gradient，以及第一个 optimizer step 后的参数。FP32 reference 使用 `rtol=1e-4, atol=1e-5`；BF16 使用 `rtol=2e-2, atol=2e-2`。若某指标不适合逐元素比对，记录最大绝对/相对误差与原因，不能只报告均值。
@@ -408,7 +425,9 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **提交：** 仅提交基准脚本、fixture、数值结果和精度修复。提交信息建议：`test: establish ROLL PrefixGrouper acceptance benchmark`。
 
-#### Phase 3 实验结果记录
+#### Phase 3.1：结果清单（dev+test）
+
+> **状态：未开始。** 以下是追加验证前的历史排查数据：未使用固定 rollout cache、未完成逐 token/短训练/负向测试，且 train-only workaround 破坏 logprob 同语义；不得作为 0.5B 限制、精度结论或 Phase 3.1 通过证据。Phase 2.1 通过后应以本节要求清单重新填写。
 
 - **精度对比脚本**：`roll/scripts/compare_precision.py`
 - **测试模型**：Qwen2.5-0.5B-Instruct、BF16、FSDP2、DP=1、G=2
@@ -430,11 +449,13 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 - 单步 per-token logprob 逐元素比对（需固定 rollout cache fixture）
 - 短训练（2 PPO epoch）逐 step 曲线
 - DP>1 / shuffle 负向验证
-- 因 0.5B 下 KL 发散，Phase 3 被标记为 `⚠️ 部分通过`，需更大模型验证
+- 旧实现的 KL 差异尚未完成根因验证；不得归因于 0.5B，需按 Phase 2.1/3.1 重跑
 
 ### Phase 4：性能归因与 MVP 范围内优化
 
 **目标：** 在保持 Phase 3 精度对齐的前提下，消除 PrefixGrouper 接入层的主要开销，直到达到最终性能门槛；本 Phase 不是只做测量，而是“测量—改动—回归”的闭环。
+
+#### Phase 4.1：要求清单（design）
 
 1. **建立分段 profile。** 对 Phase 3 固定 workload 的 off/on 分别采样，拆出 data preparation、group build/concat、attention forward、logits restore、logprob/loss、backward、optimizer 的时间和峰值显存。使用 PyTorch profiler/NVTX 或等价工具，保存 trace/表格；先确认共享 prefix 的 attention token 量确实下降。
 2. **按证据选择一个优化。** 仅优化 profile 排名前二的、属于 MVP 接入层的问题。允许的优化包括：缓存不会随 micro-batch 改变的 group 索引/position 模板；在 GPU 上向量化 concat/restore，去除 Python per-row loop 和不必要的 CPU 同步；缩小 restore/scatter 到 loss 所需的 response-logit 区域；复用 attention patch 的静态状态。每次只做一种优化，禁止凭感觉同时重写多处。
@@ -445,13 +466,15 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 
 **提交：** 每项被保留的优化独立提交并附 profile/benchmark 结果，例如 `perf: vectorize PrefixGrouper logits restore`；被放弃的实验不得混入最终功能提交。
 
-#### Phase 4 实验结果记录
+#### Phase 4.1：结果清单（dev+test）
 
-**状态**：未启动。分析：Qwen2.5-0.5B 下 prefix 占 21%（46/220 tokens），压缩 token 量有限，grouped attention + concat/restore 开销相抵消。需要 7B+ 模型（prefix > 50%）才能测量有效加速。
+**状态：** 未开始；依赖 Phase 3.1。旧 0.5B/G=2 的一次性观察不能推导“必须 7B+”；只有冻结 workload、正确 PG attention 语义和 profile 结果才能决定是否需要更大模型或更高 prefix ratio。
 
 ### Phase 5：最终复查与停止条件
 
 **目标：** 仅在“精度对齐 + 存在可复现的性能提升”同时达成时形成可 review、可上游化的 DP=1 MVP 分支。
+
+#### Phase 5.1：要求清单（design）
 
 1. 从干净 checkout 重新运行 Phase 3 的完整基准；确认结果不是 warm cache、偶然波动或先前进程残留造成的。保存命令、环境、原始测量数据和摘要表。
 2. 复查 Phase 3 的单步与短训练精度结果，以及 Phase 4 的性能结果；明确列出 off/on 的 p50、p90、显存和加速比。
@@ -460,6 +483,12 @@ restore scatter 必须保持 PyTorch autograd 图，不能 `.detach()`、转 CPU
 5. 推送最终分支，准备两个独立 review：PrefixGrouper adapter review 与 ROLL hook review。
 
 **最终终止条件：** 同一冻结 workload 上，开关 on/off 的 Phase 3 精度验收全部通过，且开关 on 的端到端 actor train-step p50 严格小于开关 off（`p50_on < p50_off`）。任一条件不满足，本开发计划**不终止**，回到 Phase 3（精度问题）或 Phase 4（性能问题）继续迭代；不得以“能运行”或“仅有理论 token 节省”替代该结论。
+
+#### Phase 5.1：结果清单（dev+test）
+
+- **状态：** 未开始；依赖 Phase 4.1。
+- **待填写：** 干净 checkout 的复现命令、最终 off/on 精度与 p50 表、默认路径零回归、非 MVP fail-fast、最终 commit/分支和两个 review 链接。
+- **终止记录：** 只有“Phase 3.1 精度全部通过”与 `p50_on < p50_off` 同时成立，才能记录“达到终止条件”。
 
 ## 5、当前结论
 
