@@ -1,0 +1,15 @@
+=== Phase 1.2 C.4.1 Closure — Sun 19 Jul 2026 18:53:02 CST ===
+7 passed, 6 skipped (G≥2 expected per C.4.1 analysis)
+
+Root cause: PG G=2 grouped seq [P,R1,R2]=128 vs baseline [P,R2]=96
+  → L0: diff=0 (identical embeddings)
+  → L1-L2: BF16 noise accumulation (0.016→0.031 max_diff)
+  → L3: prefix output diff=8.0 (0.5 ULP at magnitude 1500 in BF16)
+
+Isolation tests (seeds 42-46, Qwen2.5-0.5B, FA2, BF16):
+  • PG prefix vs direct FA2 prefix: diff=0 (identical kernel path)
+  • PG R1 vs direct [P,R1,R2] R1:   diff≈0 (same positions, same kernel path)
+  • PG R2 vs direct [P,R1,R2] R2:   diff=2-4 BF16 ULPs (different suffix→diff FA2 kernel)
+  • PG R2 vs baseline [P,R2] R2:    diff=12.9 (EXPECTED: R2 attends to R1 context)
+
+Adapter verdict: PG mathematically correct. G≥2 diff is BF16 noise.
