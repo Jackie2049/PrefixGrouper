@@ -1,0 +1,18 @@
+{
+  "P1.2-E_G2": {
+    "base_loss": 7.125,
+    "pg_loss": 7.15625,
+    "n_params": 290,
+    "n_failed": 51,
+    "all_close": false,
+    "fixture": "G=2, p_len=64, r_len=32"
+  },
+  "P1.2-E_G4": {
+    "base_loss": 6.96875,
+    "pg_loss": 6.9375,
+    "n_params": 290,
+    "n_failed": 66,
+    "all_close": false,
+    "fixture": "G=4, p_len=64, r_len=32"
+  }
+}
